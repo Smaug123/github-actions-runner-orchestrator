@@ -13,7 +13,11 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "fs"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-jsonwebtoken = { version = "10", default-features = false, features = ["use_pem"] }
+# rust_crypto selects jsonwebtoken's pure-Rust RSA backend. Without exactly one
+# of rust_crypto / aws_lc_rs, jsonwebtoken 10.x panics at *runtime* on the first
+# sign because it can't resolve a CryptoProvider. rust_crypto keeps us off the
+# aws-lc-rs C/asm build, matching the rustls (pure-Rust) TLS choice.
+jsonwebtoken = { version = "10", default-features = false, features = ["use_pem", "rust_crypto"] }
 clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
