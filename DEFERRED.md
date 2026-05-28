@@ -123,9 +123,18 @@ default. Worth doing before we trust this for anything real.
 
 ## Guest image
 
-The `guest/` directory contains a NixOS configuration sketch but isn't
-wired into the flake yet. Producing the qcow2 from a darwin host
-requires either a remote Linux builder or `linux-builder` (nix-darwin's
-managed VM), and that integration is its own moving part. For now the
-operator builds the image out-of-band and points `LIMA_TEMPLATE` at a
-Lima YAML that references it.
+`lima/runner-aarch64.yaml` is the shipped guest: a stock Ubuntu 24.04
+aarch64 cloud image that installs the Actions runner and a `gha-run-once`
+wrapper at first boot via Lima provisioning. It's the path `LIMA_TEMPLATE`
+should point at today.
+
+A NixOS-based guest built from this repo's flake would be a stronger
+story — reproducible, no apt/network at boot, and a natural home for a
+shared `/nix/store` substituter — but producing the qcow2 from a darwin
+host needs a remote Linux builder or `linux-builder` (nix-darwin's
+managed VM), and that integration is its own moving part. Deferred until
+the Ubuntu template proves the loop end to end.
+
+The Ubuntu template pins a dated image digest; refresh it from a newer
+`releases/24.04/release-YYYYMMDD/` when desired (see the comment in the
+file).

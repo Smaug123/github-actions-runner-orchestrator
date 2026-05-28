@@ -116,6 +116,21 @@ and job pickup. Safe configurations:
 There is no in-band guard for this; the launchd plist / deployment
 harness is the right place to enforce singleton.
 
+## Guest VM
+
+`lima/runner-aarch64.yaml` is the Lima template for the per-job guest.
+Point `LIMA_TEMPLATE` at it. It boots a stock Ubuntu 24.04 aarch64 cloud
+image and, via Lima provisioning, installs git + node + the GitHub
+Actions runner (linux-arm64), creates an unprivileged `runner` user, and
+drops a `gha-run-once` wrapper at `/usr/local/bin`. The consumer copies
+the JIT config into the guest and runs `sudo gha-run-once /tmp/jit`,
+which reads the config as root and execs `./run.sh --jitconfig` as the
+`runner` user — one job, then the VM is destroyed.
+
+The image is pinned to a dated Ubuntu release + digest; refresh it from a
+newer `releases/24.04/release-YYYYMMDD/` (the file has a comment showing
+how). Validate edits with `limactl validate lima/runner-aarch64.yaml`.
+
 ## See also
 
 - [`DEFERRED.md`](DEFERRED.md) — work that hasn't landed yet

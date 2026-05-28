@@ -1,0 +1,96 @@
+# Lima template for an ephemeral aarch64 Linux GitHub Actions runner guest.
+#
+# One VM runs exactly one job (JIT runners are ephemeral) then is destroyed.
+# The consumer starts a VM from this template, copies a JIT-config file into
+# the guest with `limactl copy`, then runs `sudo gha-run-once <path>` over
+# `limactl shell` (see src/runner.rs).
+#
+# Point LIMA_TEMPLATE at this file. The consumer stages its own 0600 copy
+# under STATE_DIR before handing it to limactl, so it must be a regular file
+# owned by the daemon user and not group/world-writable.
+
+vmType: vz
+arch: aarch64
+
+# Pinned to a dated Ubuntu release (not the rolling `release/` symlink, whose
+# digest changes on each respin and would break the digest check). To refresh:
+# pick a newer releases/24.04/release-YYYYMMDD/ dir and use its SHA256SUMS
+# entry for ...-arm64.img.
+images:
+  - location: "https://cloud-images.ubuntu.com/releases/24.04/release-20260518/ubuntu-24.04-server-cloudimg-arm64.img"
+    arch: aarch64
+    digest: "sha256:6a61b967ba4a27dd1966f835a67643073ed55c2860ce3dc1cb0517282e6b8bec"
+
+cpus: 4
+memory: "8GiB"
+disk: "40GiB"
+
+# Name the admin user deterministically so provisioning can target "the lima user".
+user:
+  name: lima
+
+# Minimal mounts: the consumer pushes the JIT config in with `limactl copy`,
+# so no host directories need to be shared into this ephemeral guest.
+mounts: []
+
+provision:
+  - mode: system
+    script: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      RUNNER_VERSION=2.334.0
+      RUNNER_TARBALL="actions-runner-linux-arm64-${RUNNER_VERSION}.tar.gz"
+      RUNNER_URL="https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/${RUNNER_TARBALL}"
+      RUNNER_HOME=/home/runner
+      RUNNER_DIR="${RUNNER_HOME}/actions-runner"
+
+      # Minimal toolchain: git, a JS runtime for actions that shell out to node
+      # (the runner bundles its own node for internal use), plus fetch/TLS prereqs.
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update
+      apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        git \
+        nodejs
+
+      # Non-root user that actually executes the job. The runner refuses to run
+      # as root, so the job always lands here.
+      if ! id -u runner >/dev/null 2>&1; then
+        useradd --create-home --shell /bin/bash runner
+      fi
+
+      # Passwordless sudo for the lima admin user: the consumer invokes
+      # `sudo gha-run-once ...` over `limactl shell`, which runs as `lima`.
+      install -m 0440 /dev/stdin /etc/sudoers.d/99-lima-nopasswd <<'SUDOERS'
+      lima ALL=(ALL) NOPASSWD:ALL
+      SUDOERS
+
+      # Install the GitHub Actions runner (linux-arm64).
+      mkdir -p "${RUNNER_DIR}"
+      curl -fsSL -o "${RUNNER_DIR}/${RUNNER_TARBALL}" "${RUNNER_URL}"
+      tar -xzf "${RUNNER_DIR}/${RUNNER_TARBALL}" -C "${RUNNER_DIR}"
+      rm -f "${RUNNER_DIR}/${RUNNER_TARBALL}"
+      chown -R runner:runner "${RUNNER_HOME}"
+
+      # Runner OS dependencies (libicu, etc.); must run as root.
+      "${RUNNER_DIR}/bin/installdependencies.sh"
+
+      # gha-run-once: take a JIT-config path, run one job as the runner user,
+      # then exit. Invoked as root (via the consumer's `sudo gha-run-once`), it
+      # reads the config as root and drops to the runner user. `-H` gives the
+      # runner its own HOME; `exec` propagates the runner's exit code.
+      install -m 0755 /dev/stdin /usr/local/bin/gha-run-once <<'GHARUNONCE'
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      if [ "$#" -ne 1 ]; then
+        echo "usage: gha-run-once <jit-config-path>" >&2
+        exit 2
+      fi
+
+      jit_path="$1"
+      cd /home/runner/actions-runner
+      exec sudo -H -u runner ./run.sh --jitconfig "$(cat "$jit_path")"
+      GHARUNONCE
