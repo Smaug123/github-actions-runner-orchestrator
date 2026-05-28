@@ -94,7 +94,11 @@ in
         repartConfig = {
           Type = "esp";
           Format = "vfat";
-          SizeMinBytes = "96M";
+          # The UKI (kernel+initrd) is ~86M and must fit here in full; at a
+          # tight 96M ESP, repart's vfat copy of the UKI silently failed,
+          # leaving a UKI-less, unbootable ESP (systemd-boot then finds nothing
+          # in /EFI/Linux and vz halts). Give it generous headroom.
+          SizeMinBytes = "512M";
         };
       };
       "root" = {
