@@ -48,6 +48,16 @@
         packages = {
           default = gh-actions-consumer;
           gh-actions-consumer = gh-actions-consumer;
+
+          # The ephemeral runner guest, built for aarch64-linux regardless of
+          # the host system (Nix offloads to host-setup/linux-builder). Built
+          # with systemd-repart (no VM/KVM — make-disk-image's nested VM can't
+          # run on this Apple-Silicon host), producing a UEFI appliance image
+          # that boots under Lima with no per-job provisioning. See nix/guest.nix.
+          gha-guest-image = (nixpkgs.lib.nixosSystem {
+            system = "aarch64-linux";
+            modules = [ ./nix/guest.nix ];
+          }).config.system.build.image;
         };
 
         devShells.default = craneLib.devShell {

@@ -148,17 +148,44 @@ after `JOB_MAX_RUNTIME_SECS`).
 
 ## Guest VM
 
-`lima/runner-aarch64.yaml` is the Lima template for the per-job guest.
-Point `LIMA_TEMPLATE` at it. It boots a stock Ubuntu 24.04 aarch64 cloud
-image and, via Lima provisioning, installs git + node + the GitHub
-Actions runner (linux-arm64), creates an unprivileged `runner` user, and
-drops a `gha-run-once` wrapper at `/usr/local/bin`. The consumer copies
-the JIT config into the guest and runs `sudo gha-run-once /tmp/jit`,
-which reads the config as root and execs `./run.sh --jitconfig` as the
+Whichever guest is used, the contract is the same: the consumer copies the
+JIT config into the VM and runs `sudo gha-run-once /tmp/jit`, which reads the
+config as root and execs the runner's `run.sh --jitconfig` as the unprivileged
 `runner` user — one job, then the VM is destroyed.
 
-The image is pinned to a dated Ubuntu release + digest; refresh it from a
-newer `releases/24.04/release-YYYYMMDD/` (the file has a comment showing
+### NixOS image (preferred)
+
+`nix/guest.nix` declares the guest as a NixOS appliance — the runner, a
+node24 toolchain, `gha-run-once`, the `lima`/`runner` users with passwordless
+sudo, and the Lima boot contract (cloud-init NoCloud, a native lima-guestagent
+service, `/bin/bash`). `lima/build-nixos-image.sh` builds it into a UEFI raw
+image and emits a matching Lima template:
+
+```
+./lima/build-nixos-image.sh        # prints a LIMA_TEMPLATE=... path
+```
+
+It builds `.#gha-guest-image` for `aarch64-linux` (Nix offloads to the
+`host-setup/linux-builder`, since the host is `aarch64-darwin`), copies the
+image to `~/.local/share/gha-images/` (out of the GC-able Nix store), and
+writes a template that boots it with **no per-job provisioning** — VMs are
+ready in ~15s. Point `LIMA_TEMPLATE` at the emitted template and restart the
+consumer; no code change. Re-run after editing `nix/guest.nix`.
+
+The image is built with `systemd-repart` (not `make-disk-image`, whose nested
+VM needs the `kvm` build feature unavailable on Apple Silicon). Because Lima's
+runtime guest scripts assume an FHS distro, a few of its boot scripts fail
+harmlessly on NixOS (so `systemctl is-system-running` reports `degraded`); the
+parts the consumer needs — SSH, the guest agent, sudo, `gha-run-once` — are
+provided declaratively and verified to work.
+
+### Ubuntu template (interim)
+
+`lima/runner-aarch64.yaml` boots a stock Ubuntu 24.04 aarch64 cloud image and
+installs the runner + git + node via Lima provisioning on every boot.
+`lima/build-prebuilt-image.sh` snapshots a provisioned boot into a reusable
+image. The image is pinned to a dated Ubuntu release + digest; refresh it from
+a newer `releases/24.04/release-YYYYMMDD/` (the file has a comment showing
 how). Validate edits with `limactl validate lima/runner-aarch64.yaml`.
 
 ## See also
