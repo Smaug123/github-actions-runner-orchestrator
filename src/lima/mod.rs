@@ -102,8 +102,13 @@ impl Lima {
 
     pub async fn list_names(&self) -> Result<Vec<String>> {
         let mut cmd = Command::new(&self.bin);
+        // Capture stderr rather than letting it inherit: with no instances,
+        // `limactl list` prints "No instance found ..." to stderr on every
+        // (successful) sweep, which would otherwise spam the daemon log. Keep
+        // it for the failure path so a real error still surfaces.
         cmd.args(["list", "--json"])
             .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .kill_on_drop(true);
         let child = cmd.spawn().context("spawn limactl list")?;
         let out = tokio::time::timeout(LIST_TIMEOUT, child.wait_with_output())
@@ -111,7 +116,11 @@ impl Lima {
             .map_err(|_| anyhow::anyhow!("limactl list timed out after {:?}", LIST_TIMEOUT))?
             .context("wait limactl list")?;
         if !out.status.success() {
-            anyhow::bail!("limactl list exited {}", out.status);
+            anyhow::bail!(
+                "limactl list exited {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
         }
         // `limactl list --json` emits one JSON object per line.
         let mut names = Vec::new();
