@@ -106,20 +106,10 @@ want more:
 - A `--dump-state` signal or local-socket endpoint that prints the
   current in-flight map.
 
-## Tighten the runner group's `selected_repositories`
-
-We now mint repo-scoped JIT runners, so a runner can only execute jobs
-from the repo we registered it under regardless of what other repos
-the runner group permits. That's the tight per-runner guarantee; the
-defence-in-depth on top of it is to make sure the runner group's own
-`selected_repositories` (or visibility) doesn't quietly include repos
-outside `GH_ALLOWED_REPOS`. Worth adding a startup check that lists the
-group's selected repos and refuses to run if the set isn't ⊆ allowlist.
-
 ## Multi-arch / x86 emulation
 
 Apple Silicon host with aarch64-linux guests is the only target. If a
-workflow needs x86 the cleanest path is a second runner group with a
+workflow needs x86 the cleanest path is a second consumer with a
 QEMU/TCG-backed Lima template and its own custom label
 (`lima-nix-amd64`). Not in this code yet.
 

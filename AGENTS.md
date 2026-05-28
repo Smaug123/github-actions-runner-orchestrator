@@ -25,8 +25,8 @@ src/supervisor.rs  — dispatch loop; prepare() is the validation choke point
 src/runner.rs      — per-job state machine; vm_name(repo, job_id)
 src/gc.rs          — reconciler (stale cur/, orphan VMs, offline runners)
 src/lima/mod.rs    — limactl wrapper; instance struct, timeouts, kill_on_drop
-src/github/        — App JWT, installation tokens, JIT mint (repo-scoped),
-                     org-level runner list/delete
+src/github/        — App JWT, installation tokens (account-scoped), JIT mint
+                     (repo-scoped), repo-level runner list/delete
 ```
 
 ## Invariants — do not weaken
@@ -38,10 +38,13 @@ src/github/        — App JWT, installation tokens, JIT mint (repo-scoped),
 2. **VM names come from signed body fields only.** Envelope/delivery is
    **not** under the HMAC. Use `runner::vm_name(repo, job_id)`;
    `DeliveryId` is for logging and as a filename sanity check.
-3. **Repo-scoped JIT.** `generate_jit_config` hits
-   `/repos/{owner}/{repo}/actions/runners/generate-jitconfig`. Don't
-   switch back to the org endpoint without coordinating a wider design
-   change — the per-runner repo binding is load-bearing.
+3. **Repo-scoped everything.** `generate_jit_config` hits
+   `/repos/{owner}/{repo}/actions/runners/generate-jitconfig`; runner
+   list/delete hit `/repos/{owner}/{repo}/actions/runners`. The
+   per-runner repo binding is load-bearing — don't switch to org
+   endpoints (there's no org/runner-group model here; repo runners use
+   the default group, id 1). Installation lookup is account-scoped
+   (`/users/{account}/installation`).
 4. **Label policy is an allowlist.** Workflow labels must be a subset
    of `GH_RUNNER_LABELS`. The gate label (`GH_RUNNER_LABEL`) must be
    present and must itself be in the advertised set.

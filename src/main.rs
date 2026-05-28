@@ -3,8 +3,8 @@
 //
 // The supervisor is the heart of this binary; main just parses config,
 // validates credential file modes, builds the GitHub client, does a
-// startup self-check that we can reach the App's runner-groups endpoint,
-// and hands off.
+// startup self-check that we can list runners on an allowed repo (proving
+// the App installation token and repo admin rights work), and hands off.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -77,18 +77,23 @@ async fn main() -> Result<()> {
         config.api_url.clone(),
         http,
         config.org.clone(),
-        config.runner_group.clone(),
         installations,
     ));
 
-    let group_id = gh
-        .runner_group_id()
-        .await
-        .context("startup self-check: looking up runner group")?;
+    // Startup self-check: prove the App installation token works and we hold
+    // repo admin rights by listing runners on every allowed repo. GC and
+    // teardown operate per repo, so a typo or missing App access on any one of
+    // them must fail loudly here rather than as recurring runtime errors.
+    for repo in &config.allowed_repos {
+        let (owner, name) = repo
+            .split_once('/')
+            .with_context(|| format!("GH_ALLOWED_REPOS entry {repo:?} is not owner/name"))?;
+        gh.list_runners(owner, name, "gha-")
+            .await
+            .with_context(|| format!("startup self-check: listing runners on {repo}"))?;
+    }
     tracing::info!(
-        org = %config.org,
-        runner_group = %config.runner_group,
-        runner_group_id = group_id,
+        account = %config.org,
         label = %config.runner_label,
         runner_labels = ?config.runner_labels,
         spool = %config.spool_dir.display(),

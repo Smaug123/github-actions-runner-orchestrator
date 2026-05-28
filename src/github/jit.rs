@@ -1,28 +1,23 @@
-// Runner management. Org-level for discovery and GC (the App's view of all
-// our runners lives at org scope), but JIT configs are minted with the
-// repo-scoped endpoint so a registered runner can only execute jobs from
-// the repo we intended. The runner group still gates which repos may use us;
-// repo-scoped minting is the per-runner guarantee on top of that.
+// Runner management, all repository-scoped.
+//
+// JIT configs are minted with the repo-scoped endpoint so a registered runner
+// can only execute jobs from the repo we intended. Discovery (list) and
+// cleanup (delete) are likewise repo-scoped: a personal account has no org
+// runner groups, and runners registered against a repo live in that repo's
+// default group (id 1). The runner-group concept is gone entirely.
 
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use tokio::sync::OnceCell;
 
 use super::installation::Installations;
 
-#[derive(Deserialize)]
-struct RunnerGroup {
-    id: u64,
-    name: String,
-}
-
-#[derive(Deserialize)]
-struct RunnerGroupsResp {
-    runner_groups: Vec<RunnerGroup>,
-}
+/// Repository runners always belong to the repo's default runner group, whose
+/// id is 1. The repo-scoped generate-jitconfig endpoint still requires the
+/// field, so we send the only value that's valid at repo scope.
+const REPO_DEFAULT_RUNNER_GROUP_ID: u64 = 1;
 
 #[derive(Serialize)]
 struct GenerateJitConfigBody {
@@ -61,76 +56,32 @@ struct RunnersResp {
 pub struct GhClient {
     api: String,
     http: Client,
-    org: String,
-    group_name: String,
+    account: String,
     installations: Arc<Installations>,
-    group_id: OnceCell<u64>,
 }
 
 impl GhClient {
     pub fn new(
         api: String,
         http: Client,
-        org: String,
-        group_name: String,
+        account: String,
         installations: Arc<Installations>,
     ) -> Self {
         Self {
             api,
             http,
-            org,
-            group_name,
+            account,
             installations,
-            group_id: OnceCell::new(),
         }
     }
 
     async fn token(&self) -> Result<String> {
-        self.installations.token(&self.org).await
-    }
-
-    pub async fn runner_group_id(&self) -> Result<u64> {
-        let id = self
-            .group_id
-            .get_or_try_init(|| async {
-                let tok = self.token().await?;
-                let url = format!("{}/orgs/{}/actions/runner-groups", self.api, self.org);
-                let resp = self
-                    .http
-                    .get(&url)
-                    .bearer_auth(&tok)
-                    .header("Accept", "application/vnd.github+json")
-                    .header("X-GitHub-Api-Version", "2022-11-28")
-                    .send()
-                    .await
-                    .context("GET runner-groups")?;
-                if !resp.status().is_success() {
-                    anyhow::bail!(
-                        "list runner-groups: {} {}",
-                        resp.status(),
-                        resp.text().await.unwrap_or_default()
-                    );
-                }
-                let body: RunnerGroupsResp = resp.json().await?;
-                body.runner_groups
-                    .iter()
-                    .find(|g| g.name == self.group_name)
-                    .map(|g| g.id)
-                    .with_context(|| {
-                        format!(
-                            "no runner group named {} in org {}",
-                            self.group_name, self.org
-                        )
-                    })
-            })
-            .await?;
-        Ok(*id)
+        self.installations.token(&self.account).await
     }
 
     /// Mint a JIT runner config bound to a specific repository. A runner
-    /// registered with this config can only execute jobs from {owner}/{repo}
-    /// even if the underlying runner group permits other repos, so a
-    /// workflow_job from one allowlisted repo can never capture a runner
+    /// registered with this config can only execute jobs from {owner}/{repo},
+    /// so a workflow_job from one allowlisted repo can never capture a runner
     /// minted for another.
     pub async fn generate_jit_config(
         &self,
@@ -140,14 +91,13 @@ impl GhClient {
         labels: &[&str],
     ) -> Result<JitConfigResp> {
         let tok = self.token().await?;
-        let group_id = self.runner_group_id().await?;
         let url = format!(
             "{}/repos/{}/{}/actions/runners/generate-jitconfig",
             self.api, owner, repo
         );
         let body = GenerateJitConfigBody {
             name: name.to_string(),
-            runner_group_id: group_id,
+            runner_group_id: REPO_DEFAULT_RUNNER_GROUP_ID,
             labels: labels.iter().map(|s| s.to_string()).collect(),
             work_folder: "_work".to_string(),
         };
@@ -171,15 +121,16 @@ impl GhClient {
         Ok(resp.json().await?)
     }
 
-    /// Return all runners in the org whose name starts with `prefix`.
-    pub async fn list_runners(&self, prefix: &str) -> Result<Vec<Runner>> {
+    /// Return all runners registered on {owner}/{repo} whose name starts with
+    /// `prefix`.
+    pub async fn list_runners(&self, owner: &str, repo: &str, prefix: &str) -> Result<Vec<Runner>> {
         let tok = self.token().await?;
         let mut out = Vec::new();
         let mut page = 1u32;
         loop {
             let url = format!(
-                "{}/orgs/{}/actions/runners?per_page=100&page={}",
-                self.api, self.org, page
+                "{}/repos/{}/{}/actions/runners?per_page=100&page={}",
+                self.api, owner, repo, page
             );
             let resp = self
                 .http
@@ -192,7 +143,9 @@ impl GhClient {
                 .context("GET runners")?;
             if !resp.status().is_success() {
                 anyhow::bail!(
-                    "list runners: {} {}",
+                    "list runners {}/{}: {} {}",
+                    owner,
+                    repo,
                     resp.status(),
                     resp.text().await.unwrap_or_default()
                 );
@@ -212,11 +165,11 @@ impl GhClient {
         Ok(out)
     }
 
-    pub async fn delete_runner(&self, runner_id: u64) -> Result<()> {
+    pub async fn delete_runner(&self, owner: &str, repo: &str, runner_id: u64) -> Result<()> {
         let tok = self.token().await?;
         let url = format!(
-            "{}/orgs/{}/actions/runners/{}",
-            self.api, self.org, runner_id
+            "{}/repos/{}/{}/actions/runners/{}",
+            self.api, owner, repo, runner_id
         );
         let resp = self
             .http
@@ -232,7 +185,9 @@ impl GhClient {
         // deregistered it. Treat as success.
         if !s.is_success() && s.as_u16() != 404 {
             anyhow::bail!(
-                "delete runner {}: {} {}",
+                "delete runner {}/{} {}: {} {}",
+                owner,
+                repo,
                 runner_id,
                 s,
                 resp.text().await.unwrap_or_default()

@@ -3,7 +3,8 @@
 // Truth lives in three places:
 //   1. cur/ on the spool filesystem — claimed jobs we believe are in flight,
 //   2. `limactl list` on the host — VMs that actually exist,
-//   3. /orgs/{org}/actions/runners on GitHub — runners GH thinks are registered.
+//   3. /repos/{owner}/{repo}/actions/runners on GitHub, for each allowed repo —
+//      runners GH thinks are registered.
 //
 // A periodic sweep walks all three and resolves drift:
 //
@@ -20,26 +21,26 @@
 // We never derive a vm_name from envelope/header data; using only signed
 // fields means a replay produces the same name we already know about.
 //
-// SINGLETON DEPLOYMENT REQUIRED PER (org, runner-group).
+// SINGLETON DEPLOYMENT REQUIRED PER (account, set of allowed repos).
 //
 // The runner branch below treats *this* process's cur/ as the single
-// source of truth for what `gha-<16hex>` runners should exist in the
-// org. Two consumers running against the same org with separate
+// source of truth for what `gha-<16hex>` runners should exist on each
+// allowed repo. Two consumers covering the same repo with separate
 // SPOOL_DIRs would each see the other's freshly-minted (online, not yet
 // busy) runners as orphans and delete them in the window between mint
 // and job pickup — a self-inflicted denial of service.
 //
 // Safe configurations:
-//   * one process per (org, runner-group);
+//   * one process per repo (or per disjoint set of repos);
 //   * multiple processes sharing the same SPOOL_DIR (and so the same
 //     cur/), because every consumer sees every claim;
-//   * separate consumers in *different* orgs or runner-groups.
+//   * separate consumers covering *disjoint* repo sets.
 //
-// Unsafe: separate consumers in the same (org, runner-group) with
-// separate SPOOL_DIRs. There's no in-band check for this — the org
-// runner list doesn't carry "which consumer minted me" — so the launchd
-// plist / deployment harness is the right place to enforce singleton.
-// A future option is namespacing runner names per consumer (e.g.
+// Unsafe: separate consumers covering the same repo with separate
+// SPOOL_DIRs. There's no in-band check for this — the repo runner list
+// doesn't carry "which consumer minted me" — so the launchd plist /
+// deployment harness is the right place to enforce singleton. A future
+// option is namespacing runner names per consumer (e.g.
 // `gha-<consumer-id>-<jobid>`) and restricting GC to that namespace.
 
 use std::collections::HashSet;
@@ -109,32 +110,40 @@ async fn sweep_inner(config: &Config, gh: &GhClient, lima: &Lima) -> anyhow::Res
         Err(e) => warn!(error = %e, "gc: limactl list failed"),
     }
 
-    match gh.list_runners(VM_NAME_PREFIX).await {
-        Ok(runners) => {
-            for r in runners {
-                // Restrict deletion to the exact shape this factory mints.
-                // The org's runner group may host runners from other tooling
-                // that happens to share the gha- prefix; we must never delete
-                // those.
-                if !is_managed_vm_name(&r.name) {
-                    continue;
-                }
-                let backed_by_vm = live.contains(&r.name);
-                let dead = r.status == "offline" || !r.busy;
-                if !backed_by_vm && dead {
-                    info!(
-                        runner = %r.name,
-                        status = %r.status,
-                        busy = r.busy,
-                        "gc: removing orphan runner"
-                    );
-                    if let Err(e) = gh.delete_runner(r.id).await {
-                        warn!(runner = %r.name, error = %e, "delete runner");
+    for repo_full in &config.allowed_repos {
+        let Some((owner, repo)) = repo_full.split_once('/') else {
+            warn!(repo = %sanitize_for_log(repo_full), "gc: allowed repo is not owner/name; skipping");
+            continue;
+        };
+        match gh.list_runners(owner, repo, VM_NAME_PREFIX).await {
+            Ok(runners) => {
+                for r in runners {
+                    // Restrict deletion to the exact shape this factory mints.
+                    // The repo may host runners from other tooling that happens
+                    // to share the gha- prefix; we must never delete those.
+                    if !is_managed_vm_name(&r.name) {
+                        continue;
+                    }
+                    let backed_by_vm = live.contains(&r.name);
+                    let dead = r.status == "offline" || !r.busy;
+                    if !backed_by_vm && dead {
+                        info!(
+                            runner = %r.name,
+                            repo = %repo_full,
+                            status = %r.status,
+                            busy = r.busy,
+                            "gc: removing orphan runner"
+                        );
+                        if let Err(e) = gh.delete_runner(owner, repo, r.id).await {
+                            warn!(runner = %r.name, error = %e, "delete runner");
+                        }
                     }
                 }
             }
+            Err(e) => {
+                warn!(repo = %sanitize_for_log(repo_full), error = %e, "gc: list runners failed")
+            }
         }
-        Err(e) => warn!(error = %e, "gc: list runners failed"),
     }
     Ok(())
 }

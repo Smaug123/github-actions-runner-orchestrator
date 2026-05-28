@@ -78,6 +78,8 @@ pub async fn run_job(
         &config,
         Arc::clone(&gh),
         Arc::clone(&lima),
+        owner,
+        repo,
         jit.runner.id,
     )
     .await;
@@ -124,7 +126,16 @@ async fn run_in_vm(
     Ok(())
 }
 
-async fn teardown(vm: &str, config: &Config, gh: Arc<GhClient>, lima: Arc<Lima>, runner_id: u64) {
+#[allow(clippy::too_many_arguments)]
+async fn teardown(
+    vm: &str,
+    config: &Config,
+    gh: Arc<GhClient>,
+    lima: Arc<Lima>,
+    owner: &str,
+    repo: &str,
+    runner_id: u64,
+) {
     if let Err(e) = lima.stop(vm).await {
         warn!(vm, error = %e, "stop failed");
     }
@@ -132,7 +143,7 @@ async fn teardown(vm: &str, config: &Config, gh: Arc<GhClient>, lima: Arc<Lima>,
         warn!(vm, error = %e, "delete failed");
     }
     let _ = fs::remove_file(&jit_path(config, vm)).await;
-    if let Err(e) = gh.delete_runner(runner_id).await {
+    if let Err(e) = gh.delete_runner(owner, repo, runner_id).await {
         warn!(runner_id, error = %e, "delete runner failed");
     }
 }

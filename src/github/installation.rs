@@ -1,10 +1,14 @@
 // Installation discovery and token minting.
 //
-// An org has at most one installation of a given App. We look up the
+// An account has at most one installation of a given App. We look up the
 // installation id once at startup (cached forever via OnceCell) and mint
 // installation tokens on demand, holding one in memory with a TTL of ~50
 // minutes (GitHub gives us 1 hour, we refresh early to keep the window
 // tight).
+//
+// The discovery endpoint is account-scoped: `/users/{account}/installation`
+// works for a personal (user) account. The token-mint endpoint
+// (`/app/installations/{id}/access_tokens`) is account-agnostic.
 //
 // Neither the installation-id lookup nor the token mint holds a lock across
 // its HTTP roundtrip; concurrent callers may race to mint a fresh token, and
@@ -64,12 +68,12 @@ impl Installations {
         }
     }
 
-    async fn installation_id(&self, org: &str) -> Result<u64> {
+    async fn installation_id(&self, account: &str) -> Result<u64> {
         let id = self
             .installation_id
             .get_or_try_init(|| async {
                 let jwt = app_jwt::mint(self.auth.app_id, &self.auth.pem)?;
-                let url = format!("{}/orgs/{}/installation", self.api, org);
+                let url = format!("{}/users/{}/installation", self.api, account);
                 let resp = self
                     .http
                     .get(&url)
@@ -78,7 +82,7 @@ impl Installations {
                     .header("X-GitHub-Api-Version", "2022-11-28")
                     .send()
                     .await
-                    .context("GET /orgs/{org}/installation")?;
+                    .context("GET /users/{account}/installation")?;
                 if !resp.status().is_success() {
                     anyhow::bail!(
                         "installation lookup: {} {}",
@@ -93,8 +97,8 @@ impl Installations {
         Ok(*id)
     }
 
-    pub async fn token(&self, org: &str) -> Result<String> {
-        let id = self.installation_id(org).await?;
+    pub async fn token(&self, account: &str) -> Result<String> {
+        let id = self.installation_id(account).await?;
         // Fast path: snapshot the cache under a brief lock.
         {
             let cache = self.token.lock().await;

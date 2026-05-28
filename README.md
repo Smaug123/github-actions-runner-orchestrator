@@ -37,8 +37,7 @@ nix develop --command cargo build --release
 | `GH_APP_PRIVATE_KEY_FILE` | PEM. Refused unless mode is 0600.                                        |
 | `GH_WEBHOOK_SECRET[_FILE]`| Same secret the spool uses. We re-verify HMAC on every claim.            |
 | `GH_ALLOWED_REPOS`        | Comma-separated `owner/name` list. Required; empty refuses to start.     |
-| `GH_ORG`                  | Org slug.                                                                |
-| `GH_RUNNER_GROUP`         | Self-hosted runner group name (default `lima-nix-group`).                |
+| `GH_ORG`                  | Account login (owner). For a personal account this is your username; it's the `owner` half of every allowlisted repo and is used to find the App installation. |
 | `GH_RUNNER_LABEL`         | Gate label workflows put in `runs-on` (default `lima-nix`).              |
 | `GH_RUNNER_LABELS`        | Complete advertised label set (default `self-hosted,lima-nix`).          |
 | `LIMA_TEMPLATE`           | Lima YAML for the per-job VM. Refused if a symlink or g/o-writable.      |
@@ -76,8 +75,11 @@ to `error/`.
 
 JIT runners are minted via the **repo-scoped** endpoint
 (`/repos/{owner}/{repo}/actions/runners/generate-jitconfig`), so a
-registered runner can only execute jobs from the repo we minted it for
-regardless of what other repos the runner group permits.
+registered runner can only execute jobs from the repo we minted it for.
+Repository runners always belong to the repo's default runner group
+(id 1); there is no org runner-group concept here. Discovery and cleanup
+are likewise repo-scoped (`/repos/{owner}/{repo}/actions/runners`),
+swept once per repo in `GH_ALLOWED_REPOS`.
 
 VM names are `gha-<workflow_job.id>` zero-padded to 16 hex chars, taken
 from the signed body (and from the filename, which we cross-check
@@ -93,22 +95,23 @@ Every `GC_INTERVAL_SECS` and once at startup:
   claim-time mtime) → `error/`.
 - Any `gha-*` Lima VM not backed by a live `cur/` entry → `limactl stop
   && limactl delete`.
-- Any org-side runner with the `gha-` prefix that is offline (or not
-  busy) and not backed by a `cur/` entry → DELETE via API.
+- For each repo in `GH_ALLOWED_REPOS`, any repo-side runner with the
+  `gha-` prefix that is offline (or not busy) and not backed by a `cur/`
+  entry → DELETE via API.
 
-### Singleton per (org, runner-group)
+### Singleton per (account, allowed repos)
 
 The runner-cleanup branch treats *this* process's `cur/` as the only
-source of truth for what `gha-<16hex>` runners ought to exist in the
-org. **Do not run two consumers against the same `GH_ORG` +
-`GH_RUNNER_GROUP` with separate `SPOOL_DIR`s** — each would see the
-other's freshly-minted (online, not yet busy) runners as orphans and
-delete them between mint and job pickup. Safe configurations:
+source of truth for what `gha-<16hex>` runners ought to exist on each
+allowlisted repo. **Do not run two consumers covering the same repo with
+separate `SPOOL_DIR`s** — each would see the other's freshly-minted
+(online, not yet busy) runners as orphans and delete them between mint
+and job pickup. Safe configurations:
 
-- One consumer process per `(GH_ORG, GH_RUNNER_GROUP)`.
+- One consumer process per repo (or per disjoint set of repos).
 - Multiple processes sharing the same `SPOOL_DIR` (and so the same
   `cur/`), because each sees every claim.
-- Separate consumers against different orgs or runner-groups.
+- Separate consumers covering *disjoint* repo sets.
 
 There is no in-band guard for this; the launchd plist / deployment
 harness is the right place to enforce singleton.
@@ -117,5 +120,4 @@ harness is the right place to enforce singleton.
 
 - [`DEFERRED.md`](DEFERRED.md) — work that hasn't landed yet
   (`/nix/store` sharing, Keychain integration, launchd plist, graceful
-  shutdown, runner-group `selected_repositories` check, multi-arch,
-  integration tests, guest image).
+  shutdown, multi-arch, integration tests, guest image).

@@ -50,13 +50,11 @@ pub struct Config {
     #[arg(long, env = "GH_ALLOWED_REPOS", value_delimiter = ',')]
     pub allowed_repos: Vec<String>,
 
-    /// Organisation slug whose runners we manage.
+    /// Account login (owner) whose repositories we manage runners for. For a
+    /// personal account this is your username; it's used to find the App
+    /// installation and is the `owner` half of every repo in the allowlist.
     #[arg(long, env = "GH_ORG")]
     pub org: String,
-
-    /// Name of the self-hosted runner group to register JIT runners against.
-    #[arg(long, env = "GH_RUNNER_GROUP", default_value = "lima-nix-group")]
-    pub runner_group: String,
 
     /// Gate label that workflows put in `runs-on` to opt into this factory.
     /// Must also appear in `runner_labels`.
