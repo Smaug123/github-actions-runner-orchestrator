@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::fs::Metadata;
 use std::io::{Read, Write};
+use std::net::SocketAddr;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -113,6 +114,12 @@ pub struct Config {
     /// default; bearer credentials would otherwise travel in clear text.
     #[arg(long, env = "GH_INSECURE_ALLOW_HTTP_API", default_value_t = false)]
     pub insecure_allow_http_api: bool,
+
+    /// Optional loopback HTTP control endpoint for pause/resume/status, e.g.
+    /// `127.0.0.1:9100`. Unset disables it. Non-loopback addresses are refused:
+    /// the endpoint has no auth, so loopback is the trust boundary.
+    #[arg(long, env = "CONTROL_ADDR")]
+    pub control_addr: Option<String>,
 }
 
 fn default_runner_labels() -> Vec<String> {
@@ -207,7 +214,29 @@ impl Config {
                 self.api_url
             );
         }
+        // Fail fast on a malformed/non-loopback control address rather than at
+        // server-spawn time.
+        self.control_socket_addr()?;
         Ok(())
+    }
+
+    /// Parse and validate `CONTROL_ADDR`. `None` when unset. Errors if it isn't
+    /// a valid socket address or isn't a loopback address (the control endpoint
+    /// has no auth, so it must not be exposed off-host).
+    pub fn control_socket_addr(&self) -> Result<Option<SocketAddr>> {
+        let Some(s) = &self.control_addr else {
+            return Ok(None);
+        };
+        let addr: SocketAddr = s
+            .parse()
+            .with_context(|| format!("CONTROL_ADDR {s:?} is not a valid socket address"))?;
+        if !addr.ip().is_loopback() {
+            anyhow::bail!(
+                "CONTROL_ADDR {addr} is not loopback; the control endpoint has no auth \
+                 and must bind a loopback address"
+            );
+        }
+        Ok(Some(addr))
     }
 
     pub fn allowed_repos_set(&self) -> HashSet<String> {

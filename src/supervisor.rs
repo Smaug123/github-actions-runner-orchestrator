@@ -58,6 +58,28 @@ pub async fn run(rt: Runtime) -> Result<()> {
     let spool = Arc::new(Spool::new(config.spool_dir.clone()));
     let permits = Arc::new(Semaphore::new(config.max_concurrency));
 
+    // Pause gate: while true the dispatch loop stops claiming new jobs (they
+    // wait in new/); in-flight jobs and the GC keep running. Flipped by the
+    // optional loopback control server. Held open here so the receiver never
+    // sees the sender dropped when the control server is disabled.
+    let (pause_tx, mut pause_rx) = tokio::sync::watch::channel(false);
+    if let Some(addr) = config.control_socket_addr()? {
+        // Bind here, not inside the task, so a failure (e.g. port in use) fails
+        // startup rather than silently leaving no control endpoint.
+        let listener = crate::control::bind(addr).await?;
+        let state = crate::control::ControlState {
+            pause: pause_tx.clone(),
+            permits: Arc::clone(&permits),
+            max_concurrency: config.max_concurrency,
+        };
+        tokio::spawn(async move {
+            if let Err(e) = crate::control::serve(listener, state).await {
+                error!(error = %format!("{e:#}"), "control server exited");
+            }
+        });
+        info!(%addr, "control server listening");
+    }
+
     crate::gc::sweep(&config, &gh, &lima).await;
 
     let (tx, mut rx) = mpsc::channel::<String>(256);
@@ -83,29 +105,40 @@ pub async fn run(rt: Runtime) -> Result<()> {
         });
     }
 
-    while let Some(name) = rx.recv().await {
-        // Acquire the concurrency permit BEFORE trying to claim the file.
+    'dispatch: while let Some(name) = rx.recv().await {
+        // Acquire a permit while honoring pause. Two rules:
         //
-        // The cur/ directory is treated by the rest of the system as
-        // ground truth for in-flight jobs: GC ages cur/ entries from the
-        // claim's mtime (gc.rs::expire_stale_cur), and JIT runners are
-        // minted on the assumption that the cur/ entry will survive at
-        // least until the job finishes. If we claimed first and then
-        // blocked waiting for a permit, a long enough wait would let GC
-        // move the cur/ entry to error/ underneath us — and we'd later
-        // mint a JIT runner with no spool record backing it.
+        //  - Acquire the permit BEFORE claiming. The cur/ directory is ground
+        //    truth for in-flight jobs: GC ages cur/ entries from the claim's
+        //    mtime (gc.rs::expire_stale_cur) and JIT runners are minted assuming
+        //    the cur/ entry outlives the job. Claiming first then blocking for a
+        //    permit could let GC move the cur/ entry to error/ under us, leaving
+        //    a runner with no backing spool record. (If the channel backs up,
+        //    the watcher's periodic rescan replays surviving new/ entries.)
         //
-        // Acquiring the permit first means cur/ only ever contains jobs
-        // we are actively prepared to run. If the channel backs up while
-        // we hold permits open during validation, the watcher's periodic
-        // rescan will replay the surviving new/ entries once a permit
-        // frees up.
-        let permit = match Arc::clone(&permits).acquire_owned().await {
-            Ok(p) => p,
-            Err(_) => {
-                error!("semaphore closed; bailing out of dispatch");
-                break;
+        //  - Don't claim — or pin a permit — while paused, so a clean drain can
+        //    reach in_flight == 0. Re-check pause AFTER the (possibly long)
+        //    acquire, since it may flip while we wait for capacity; otherwise a
+        //    freed permit would let one more job through after pause.
+        let permit = loop {
+            // Returns immediately when not paused; errors only if pause_tx is
+            // dropped, which never happens while it lives in this scope.
+            let _ = pause_rx.wait_for(|paused| !*paused).await;
+            let permit = match Arc::clone(&permits).acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => {
+                    error!("semaphore closed; bailing out of dispatch");
+                    break 'dispatch;
+                }
+            };
+            if *pause_rx.borrow() {
+                // Paused while we waited for capacity: release and re-wait so we
+                // neither claim during pause nor pin a permit that would keep
+                // in_flight above 0.
+                drop(permit);
+                continue;
             }
+            break permit;
         };
         match prepare(
             &spool,

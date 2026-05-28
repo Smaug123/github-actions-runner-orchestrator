@@ -24,6 +24,7 @@ src/spool.rs       — Spool (claim/finalize), read_spool_file, DeliveryId,
 src/supervisor.rs  — dispatch loop; prepare() is the validation choke point
 src/runner.rs      — per-job state machine; vm_name(repo, job_id)
 src/gc.rs          — reconciler (stale cur/, orphan VMs, offline runners)
+src/control.rs     — optional loopback HTTP control endpoint (pause/resume/status)
 src/lima/mod.rs    — limactl wrapper; instance struct, timeouts, kill_on_drop
 src/github/        — App JWT, installation tokens (account-scoped), JIT mint
                      (repo-scoped), repo-level runner list/delete
@@ -101,6 +102,6 @@ hand.
 - `anyhow` at the top level; constructed errors get a `.context(...)`
   string oriented around what we were doing, not the syscall.
 - New deps need a reason. Current set is intentionally small:
-  `tokio`, `reqwest` (rustls), `serde`, `serde_json`, `clap`,
-  `tracing`, `tracing-subscriber`, `notify`, `anyhow`, `hmac`, `sha2`,
-  `hex`, `libc`, `jsonwebtoken`.
+  `tokio`, `reqwest` (rustls), `axum` (loopback control endpoint), `serde`,
+  `serde_json`, `clap`, `tracing`, `tracing-subscriber`, `notify`, `anyhow`,
+  `hmac`, `sha2`, `hex`, `libc`, `jsonwebtoken`.

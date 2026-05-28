@@ -14,6 +14,7 @@ use clap::Parser;
 use tracing_subscriber::{fmt, EnvFilter};
 
 mod config;
+mod control;
 mod gc;
 mod github;
 mod lima;

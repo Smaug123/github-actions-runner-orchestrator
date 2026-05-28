@@ -47,6 +47,7 @@ nix develop --command cargo build --release
 | `GC_INTERVAL_SECS`        | Default 300.                                                             |
 | `GH_API_TIMEOUT_SECS`     | Per-request HTTP timeout. Default 60.                                    |
 | `GH_API_URL`              | API base. Override for GHES.                                             |
+| `CONTROL_ADDR`            | Optional loopback HTTP control endpoint, e.g. `127.0.0.1:9100`. Unset disables it. Non-loopback is refused (no auth). See [Pausing](#pausing). |
 
 ## What we accept
 
@@ -115,6 +116,35 @@ and job pickup. Safe configurations:
 
 There is no in-band guard for this; the launchd plist / deployment
 harness is the right place to enforce singleton.
+
+## Pausing
+
+Set `CONTROL_ADDR` (e.g. `127.0.0.1:9100`) to expose a tiny loopback HTTP
+endpoint:
+
+- `POST /pause` — stop claiming **new** jobs. In-flight VMs and the GC keep
+  running; queued deliveries stay in `new/` until resume.
+- `POST /resume` — start claiming again.
+- `GET /status` — JSON `{paused, in_flight, max_concurrency}`.
+
+The endpoint has no auth, so it must bind a loopback address (non-loopback is
+refused at startup); the host boundary is the trust boundary.
+
+The main use is a **clean shutdown / version migration** of the consumer
+without orphaning work:
+
+```
+curl -XPOST localhost:9100/pause
+# wait until nothing is in flight:
+until [ "$(curl -s localhost:9100/status | jq .in_flight)" = 0 ]; do sleep 5; done
+# now stop the consumer, deploy the new build, start it again
+```
+
+Keep the spool (and its tunnel) running throughout — webhooks land on the
+spool, not the consumer, so deliveries during the consumer's downtime are
+captured in `new/` and drained on restart. A blunt restart without pausing is
+also safe for *queued* jobs, but abandons in-flight VMs (GC reaps them only
+after `JOB_MAX_RUNTIME_SECS`).
 
 ## Guest VM
 
