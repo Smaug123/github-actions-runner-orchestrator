@@ -172,6 +172,13 @@ writes a template that boots it with **no per-job provisioning** — VMs are
 ready in ~15s. Point `LIMA_TEMPLATE` at the emitted template and restart the
 consumer; no code change. Re-run after editing `nix/guest.nix`.
 
+Nix is part of the OS here, with `nix-command` + `flakes` enabled, so jobs run
+`nix build` / `nix develop` / `nix flake …` directly. **Workflows targeting
+this runner must not run a Nix installer** (e.g. `DeterminateSystems/nix-installer-action`):
+it refuses on NixOS and would fight the daemon-managed, read-only `/etc/nix`.
+Drop the install step. Store warmth comes from the shared substituter (planned,
+Phase 3), not a per-job cache action.
+
 The image is built with `systemd-repart` (not `make-disk-image`, whose nested
 VM needs the `kvm` build feature unavailable on Apple Silicon). Because Lima's
 runtime guest scripts assume an FHS distro, a few of its boot scripts fail

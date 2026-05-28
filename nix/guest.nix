@@ -212,13 +212,23 @@ in
   '';
 
   # Minimal job toolchain: the runner itself, gha-run-once, plus git + node
-  # for actions/checkout and node-based actions. A warm Nix store is Phase 2.
+  # for actions/checkout and node-based actions.
   environment.systemPackages = [
     gha-run-once
     github-runner
     pkgs.git
     pkgs.nodejs_24
   ];
+
+  # Nix is provided by the OS here, so workflows must NOT run the Determinate
+  # (or any) Nix installer — it refuses on NixOS and would fight the
+  # daemon-managed, read-only /etc/nix. Enable the modern CLI + flakes
+  # system-wide so jobs can call `nix build` / `nix develop` / `nix flake`
+  # directly (the daemon + `nix` on PATH come from NixOS by default). The
+  # runner stays a non-trusted daemon user; Phase 3 bakes the shared substituter
+  # into this system config so jobs get a warm store without needing
+  # trusted-user (which would let untrusted job code add arbitrary caches).
+  nix.settings.experimental-features = [ "nix-command" "flakes" ];
 
   # Ephemeral, single-job VM: stateVersion only governs stateful-service
   # migration semantics we never hit, so track the pinned nixpkgs.
