@@ -61,10 +61,15 @@ provision:
         useradd --create-home --shell /bin/bash runner
       fi
 
-      # Passwordless sudo for the lima admin user: the consumer invokes
-      # `sudo gha-run-once ...` over `limactl shell`, which runs as `lima`.
-      install -m 0440 /dev/stdin /etc/sudoers.d/99-lima-nopasswd <<'SUDOERS'
+      # Passwordless sudo for both the lima admin user (the consumer invokes
+      # `sudo gha-run-once ...` over `limactl shell`, which runs as `lima`) and
+      # the runner user (workflows run as `runner` and expect passwordless sudo,
+      # matching GitHub-hosted runners — many actions, e.g. the Determinate Nix
+      # installer, call sudo). Root inside this throwaway VM is fine; the VM is
+      # the isolation boundary, not the user account within it.
+      install -m 0440 /dev/stdin /etc/sudoers.d/99-gha-nopasswd <<'SUDOERS'
       lima ALL=(ALL) NOPASSWD:ALL
+      runner ALL=(ALL) NOPASSWD:ALL
       SUDOERS
 
       # Install the GitHub Actions runner (linux-arm64).
