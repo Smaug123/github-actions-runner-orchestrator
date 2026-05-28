@@ -1,0 +1,9 @@
+Host linux-builder
+  HostName 127.0.0.1
+  Port 31022
+  User builder
+  IdentityFile /etc/nix/builder_ed25519
+  IdentitiesOnly yes
+  HostKeyAlias linux-builder
+  UserKnownHostsFile /etc/nix/known_hosts
+  StrictHostKeyChecking accept-new

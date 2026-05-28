@@ -2,3 +2,10 @@
 /result
 /result-*
 .direnv/
+
+# darwin.linux-builder writes these into its working dir (its SSH keypair and
+# VM disk). Never commit them — keys/ holds a private key. Unanchored so they
+# match wherever the builder is run from. Better still: run it from a dedicated
+# dir outside the repo (see host-setup/linux-builder/README.md).
+keys/
+nixos.qcow2
