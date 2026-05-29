@@ -22,7 +22,7 @@ images:
     digest: "sha256:6a61b967ba4a27dd1966f835a67643073ed55c2860ce3dc1cb0517282e6b8bec"
 
 cpus: 4
-memory: "8GiB"
+memory: "12GiB"
 disk: "40GiB"
 
 # Name the admin user deterministically so provisioning can target "the lima user".

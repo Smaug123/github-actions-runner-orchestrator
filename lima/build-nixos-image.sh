@@ -74,7 +74,7 @@ images:
     arch: aarch64
     digest: "$digest"
 cpus: 4
-memory: "8GiB"
+memory: "12GiB"
 disk: "40GiB"
 user:
   name: lima

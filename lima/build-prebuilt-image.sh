@@ -9,7 +9,7 @@
 #
 # Requirements: limactl and nix (used for qemu-img; the host has no qemu). No
 # host sudo — image cleaning uses the guest's passwordless sudo. Run when the
-# host is otherwise idle: it boots a 4-vCPU / 8 GiB VM, which would contend
+# host is otherwise idle: it boots a 4-vCPU / 12 GiB VM, which would contend
 # with live job VMs.
 #
 # Re-run whenever the runner version or the provisioning in runner-aarch64.yaml
@@ -90,7 +90,7 @@ images:
     arch: aarch64
     digest: "$digest"
 cpus: 4
-memory: "8GiB"
+memory: "12GiB"
 disk: "40GiB"
 user:
   name: lima
