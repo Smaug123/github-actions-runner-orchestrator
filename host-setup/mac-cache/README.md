@@ -20,18 +20,17 @@ domain"). Segmenting per-repo is deferred (`DEFERRED.md`).
 ## Status — built so far
 
 - **slice 1: signing keypair + curated cache docroot.** `init-cache.sh`.
-- **slice 2a (this commit): confined static server + serve-start gate.**
-  `serve-cache.sh` + `common.sh` (shared layout, so the gate checks the same
-  key path the writer created). Locally verified; deployment is slice 2b.
+- **slice 2a: confined static server + serve-start gate.** `serve-cache.sh` +
+  `common.sh` (shared layout, so the gate checks the same key path the writer
+  created).
+- **slice 2b (this commit): deploy under launchd + tests.** `setup-server.sh`
+  (creates the `_gha-cache` user, installs/loads the LaunchDaemon, asserts the
+  user can't read the key) and `test-cache.sh` (the (+)/(−) harness). Binds
+  **loopback** — see "Deploying the server" for why that, not a `pf`-fenced LAN
+  address.
 
 Still to come (separate slices):
 
-- **slice 2b — deploy the server:** create the dedicated `_gha-cache` user,
-  install the launchd plist, determine the guest-reachable `host.lima.internal`
-  bind address + add a `pf` rule, and run the (+)/(−) tests (a guest fetches a
-  signed path; a live `/nix/store` path is **not** fetchable; a non-Lima
-  address cannot connect; a key symlink/hardlink in the docroot returns
-  403/404).
 - `warm-cache.sh <flake-target>`: `nix copy` the full **build closure** (not
   just outputs — outputs-only misses `cargoArtifacts`) into the docroot, force
   `aarch64-linux`, record a manifest, prune behind a host-level lock.
@@ -81,7 +80,9 @@ layers, strongest first:
    if any entry shares the key's `(dev, inode)` (a hardlink) — one ground-truth
    check covering `init-cache.sh`, `warm-cache.sh`, and manual edits alike.
 4. **No autoindex** (`--no-listing`) and **a specific bind address only**, never
-   `0.0.0.0` (slice 2b sets it to the guest-reachable `host.lima.internal`).
+   `0.0.0.0`. In this deployment that address is `127.0.0.1` (loopback); see
+   "Deploying the server" for why loopback is what makes it guest-reachable
+   *and* off the LAN.
 
 Config (env): `GHA_CACHE_BIND_ADDR` (**required**; a canonical specific IPv4 —
 any-address forms like `0`/`0.0`/`0.0.0.0` are rejected), `GHA_CACHE_PORT`
@@ -94,6 +95,60 @@ where `init-cache.sh`, run as `ci`, wrote the cache.
 Run modes: **as root** (launchd/production) it chroots and drops to the
 dedicated user; **as non-root** it serves as the invoking user with NO chroot
 and NO privilege drop, printing a loud warning — local testing only.
+
+## Deploying the server
+
+Three steps, in order:
+
+    brew install darkhttpd          # the static server binary
+    ./init-cache.sh                 # as the signing user (no sudo) — keypair + docroot
+    sudo ./setup-server.sh          # create _gha-cache, install + load the LaunchDaemon
+
+`setup-server.sh` is idempotent. It creates the dedicated `_gha-cache` service
+user/group (hidden, no login, no home), then **actually attempts to read the
+signing key as that user and aborts if it succeeds** (the whole defense rests on
+that read failing, so it is verified rather than assumed). It then installs
+**root-owned copies** of `serve-cache.sh`, `common.sh`, **and the `darkhttpd`
+binary** to `/usr/local/libexec/gha-mac-cache/` (override `GHA_CACHE_LIBEXEC`)
+and points the daemon at those — the root daemon must never execute code (script
+*or* binary) out of a user-writable path like the checkout or Homebrew, or
+anyone who can write it would get root code-execution on the next launch. The
+daemon's `PATH` is likewise pinned to root-owned system dirs only (no
+`/opt/homebrew/bin`), and the install dir's whole (canonicalised) ancestry is
+asserted root-owned and not group/other/ACL-writable. (Re-run setup to pick up a `darkhttpd`
+or script update — the daemon runs the snapshots, not the live copies.) Finally
+it creates a root-owned log dir
+outside the docroot and installs + loads
+`/Library/LaunchDaemons/uk.co.patrickstevens.gha-mac-cache.plist`. The daemon
+runs the installed `serve-cache.sh` copy **as root** so it can chroot and
+privilege-drop; logs go to `/Library/Logs/gha-mac-cache/serve.{out,err}.log`.
+**Re-run `setup-server.sh` after editing the scripts** (the daemon runs the
+installed copy, not the checkout); `sudo ./setup-server.sh uninstall
+[--purge-user]` reverses it. `./setup-server.sh print-plist` emits the plist
+without root (for review).
+
+**Bind model — loopback, no `pf` rule (a deliberate deviation from the original
+plan).** Lima's `vz` guests use the built-in user-mode network (`192.168.5.0/24`,
+guest `…5.15`). `host.lima.internal` (`192.168.5.2`) is **virtual** — there is no
+real host interface at that address to bind or to fence with `pf`; it lives
+inside Lima's in-process usernet gateway, which forwards `host.lima.internal:PORT`
+to the host's **`127.0.0.1:PORT`**. So the server binds **`127.0.0.1`**: that is
+exactly what the guests reach (as `host.lima.internal:8080`) and it is not
+LAN-routable, satisfying the "never `0.0.0.0`/LAN" intent. A `pf` rule on
+loopback would be redundant, so none is added. Trade-off: any *host-local*
+process can also reach `127.0.0.1:8080` — acceptable, because the docroot is
+public (the inode gate + dedicated user guarantee no secret is ever served).
+
+### Testing the deployment
+
+    ./test-cache.sh                 # host-side (+)/(-) checks vs the running daemon
+    ./test-cache.sh --dev           # same checks against a darkhttpd this script starts
+    ./test-cache.sh --vm NAME       # also run guest-side checks inside Lima VM NAME
+
+The guest-side checks run `curl` *inside* a Lima VM, so point `--vm` at a
+**throwaway** VM — not one of the busy ephemeral `gha-*` runners. They assert a
+guest fetches `nix-cache-info` via `host.lima.internal` (proving the usernet
+forward) and that a live `/nix/store` path is 404 (curated, not the whole store).
 
 ## Layout
 
