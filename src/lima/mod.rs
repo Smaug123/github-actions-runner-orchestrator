@@ -1,9 +1,17 @@
 // Thin wrapper around the `limactl` CLI.
 //
-// All operations are best-effort and idempotent where Lima allows: --force on
-// stop and delete swallows "instance not found" / "already stopped". We never
+// `stop` is best-effort and idempotent: --force swallows "already stopped" and
+// its exit status is intentionally ignored (a VM may already be stopped). But
+// `delete` is the reap *gate*: it must only report success once the instance is
+// actually gone, so the GC reap guards can safely archive a claim and drop live
+// state. `limactl delete --force` exits 0 even for an absent instance, so a
+// clean exit-0 covers a genuinely-gone VM; on ANY other outcome (non-zero exit
+// OR a timeout/command error) we re-check presence via `list` and return Err
+// iff the instance survived (or if presence can't be determined). We never
 // parse limactl's free-text output; only `list --json` is structured, and we
-// only look at the `name` field there.
+// only look at the `name` and `dir` fields there (`dir` is the per-instance
+// directory holding the realized `lima.yaml`, which GC reads to learn each
+// VM's booted guest image for stale-image reaping).
 //
 // Every invocation is wrapped with a timeout and `kill_on_drop(true)`. If the
 // timeout fires (or the future is cancelled), the child Lima process is
@@ -93,14 +101,73 @@ impl Lima {
         Ok(())
     }
 
+    /// Delete an instance. The contract is crisp: `delete` returns `Ok(())`
+    /// **iff the VM is gone afterward**, and `Err` while it still exists (or
+    /// when presence genuinely can't be determined — a conservative `Err`).
+    /// Callers (GC's reap guards) rely on this to decide whether it's safe to
+    /// archive a VM's claim and drop its live state: a delete that merely
+    /// *spawned* limactl but left the VM (and its possibly-online runner) up
+    /// must surface as `Err` so they retry instead of treating a live runner as
+    /// unbacked.
+    ///
+    /// `limactl delete --force` exits 0 even for an already-absent instance (it
+    /// logs "Ignoring non-existent instance" and succeeds), so a clean exit-0
+    /// is the happy path: the VM is gone, no extra `list` call needed.
+    ///
+    /// On ANY failure to confirm that happy path — a non-zero exit (instance
+    /// busy/locked, driver wedged) OR a `run_with_timeout` error/timeout (the
+    /// command never produced a status) — we do NOT trust the failure to mean
+    /// "still present": the VM may well have been reaped before limactl timed
+    /// out or errored. We resolve the ambiguity the same way in both cases by
+    /// re-checking presence via `instance_exists`: gone -> `Ok`, still present
+    /// -> `Err`. A failure of the presence check itself propagates as `Err`
+    /// (conservative — we couldn't prove the VM gone). Crucially we must not
+    /// let the `?` on the delete command short-circuit past this re-check, so
+    /// we capture its result rather than propagating.
     pub async fn delete(&self, name: &str) -> Result<()> {
         let mut cmd = Command::new(&self.bin);
         cmd.args(["delete", "--force", name]).kill_on_drop(true);
-        let _ = run_with_timeout(cmd, DELETE_TIMEOUT, "limactl delete").await?;
+        // Capture (don't `?`-propagate): a timeout/wait error must still fall
+        // through to the presence re-check below, since the VM may be gone.
+        match run_with_timeout(cmd, DELETE_TIMEOUT, "limactl delete").await {
+            Ok(status) if status.success() => return Ok(()),
+            // Non-zero exit or command error/timeout: resolve via presence.
+            // `instance_exists` failing propagates as a conservative Err.
+            Ok(status) => {
+                if self.instance_exists(name).await? {
+                    anyhow::bail!("limactl delete {name} exited {status} and {name} still exists");
+                }
+            }
+            Err(e) => {
+                if self.instance_exists(name).await? {
+                    return Err(e).with_context(|| {
+                        format!("limactl delete {name} failed and {name} still exists")
+                    });
+                }
+            }
+        }
         Ok(())
     }
 
-    pub async fn list_names(&self) -> Result<Vec<String>> {
+    /// True iff an instance with this exact name is still present per
+    /// `limactl list`. Used by `delete` to turn a non-zero delete exit into a
+    /// definitive "still present" / "actually gone" answer.
+    async fn instance_exists(&self, name: &str) -> Result<bool> {
+        let instances = self
+            .list_instances()
+            .await
+            .with_context(|| format!("re-list to confirm delete of {name}"))?;
+        Ok(instances.iter().any(|(n, _)| n == name))
+    }
+
+    /// Every existing Lima instance as `(name, instance_dir)`. The instance
+    /// dir is the `.Dir` field (`build-prebuilt-image.sh` reads it the same
+    /// way) and holds the realized `lima.yaml`; GC reads
+    /// `<dir>/lima.yaml`'s `images:` `location:` to learn which guest image a
+    /// VM was booted from for stale-image reaping. A row missing `dir` (older
+    /// Lima, or a partially-realized instance) yields `None` so the caller can
+    /// fail safe and skip it rather than misclassify.
+    pub async fn list_instances(&self) -> Result<Vec<(String, Option<PathBuf>)>> {
         let mut cmd = Command::new(&self.bin);
         // Capture stderr rather than letting it inherit: with no instances,
         // `limactl list` prints "No instance found ..." to stderr on every
@@ -123,7 +190,7 @@ impl Lima {
             );
         }
         // `limactl list --json` emits one JSON object per line.
-        let mut names = Vec::new();
+        let mut instances = Vec::new();
         for line in out.stdout.split(|&b| b == b'\n') {
             if line.is_empty() {
                 continue;
@@ -133,10 +200,12 @@ impl Lima {
                 Err(_) => continue,
             };
             if let Some(n) = v.get("name").and_then(|n| n.as_str()) {
-                names.push(n.to_string());
+                // `dir` is the lowercase JSON key for the Go `.Dir` field.
+                let dir = v.get("dir").and_then(|d| d.as_str()).map(PathBuf::from);
+                instances.push((n.to_string(), dir));
             }
         }
-        Ok(names)
+        Ok(instances)
     }
 }
 

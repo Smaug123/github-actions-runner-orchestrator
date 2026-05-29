@@ -151,22 +151,40 @@ Every `GC_INTERVAL_SECS` and once at startup:
   `gha-` prefix that is offline (or not busy) and not backed by a `cur/`
   entry → DELETE via API.
 
-### Singleton per (account, allowed repos)
+### Singleton: exactly one consumer per `SPOOL_DIR` (and per account, allowed repos)
 
 The runner-cleanup branch treats *this* process's `cur/` as the only
 source of truth for what `gha-<16hex>` runners ought to exist on each
 allowlisted repo. **Do not run two consumers covering the same repo with
 separate `SPOOL_DIR`s** — each would see the other's freshly-minted
 (online, not yet busy) runners as orphans and delete them between mint
-and job pickup. Safe configurations:
+and job pickup.
+
+The VM reaper (startup orphan reap + stale-image sweep) additionally
+requires **exactly one consumer per `SPOOL_DIR`**. Running multiple
+consumers against one shared `SPOOL_DIR` is **no longer supported**: each
+would stop + delete the others' managed VMs (the startup reap deletes
+*every* pre-existing `gha-<16hex>` VM; the stale-image sweep deletes any
+whose booted image differs from *that* consumer's `LIMA_TEMPLATE`) and
+finalize the others' live `cur/` claims to `error/`, failing their
+in-flight jobs.
+
+Safe configurations:
 
 - One consumer process per repo (or per disjoint set of repos).
-- Multiple processes sharing the same `SPOOL_DIR` (and so the same
-  `cur/`), because each sees every claim.
-- Separate consumers covering *disjoint* repo sets.
+- Separate consumers covering *disjoint* repo sets, each with its own
+  `SPOOL_DIR`.
 
 There is no in-band guard for this; the launchd plist / deployment
 harness is the right place to enforce singleton.
+
+The reaper's reaping of a **claimed** VM (the startup orphan reap and the
+stale-image sweep above) archives that job's `cur/` record to `error/` and
+relies on the [reconciler](#reconciler) to re-mint it if GitHub still reports
+it queued. It therefore **requires `RECONCILE_ENABLED=true`** (the default):
+with reconciliation off, a claimed-but-still-queued job whose VM is reaped is
+archived to `error/` and never re-run, so **startup refuses to run with
+`RECONCILE_ENABLED=false`**.
 
 ## Pausing
 

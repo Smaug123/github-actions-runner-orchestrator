@@ -117,6 +117,15 @@ async fn main() -> Result<()> {
         "ready",
     );
 
+    // Reap every pre-existing managed VM before the supervisor can claim or
+    // launch any job. A fresh consumer cannot re-adopt an in-flight VM's runner
+    // session, so each lingering VM only oversubscribes the host and steals
+    // freshly-queued jobs under a possibly-superseded image. Ordering is
+    // load-bearing: this must precede supervisor::run (and the VMs it boots) so
+    // it never deletes a VM the new consumer just started. After a clean
+    // pause->drain->restart there are none and this is a no-op.
+    gc::reap_all_managed_vms_at_startup(&config, &lima).await;
+
     let runtime = supervisor::Runtime {
         config: Arc::clone(&config),
         gh: Arc::clone(&gh),

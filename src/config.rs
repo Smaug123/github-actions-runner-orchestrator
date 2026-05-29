@@ -238,6 +238,20 @@ impl Config {
         if self.api_timeout_secs == 0 {
             anyhow::bail!("GH_API_TIMEOUT_SECS must be >= 1");
         }
+        // The VM reaper (startup orphan reap + stale-image sweep, see gc.rs)
+        // runs unconditionally and archives a reaped job's cur/ claim to error/.
+        // Only the reconciler re-mints a runner for a job GitHub still reports
+        // queued, so with reconciliation off a claimed-but-still-queued job
+        // whose VM is reaped would be stranded. Refuse the unsafe combination
+        // up front rather than silently dropping such jobs.
+        if !self.reconcile_enabled {
+            anyhow::bail!(
+                "RECONCILE_ENABLED must be true: the VM reaper relies on the \
+                 reconciler to re-mint any reaped job still queued on GitHub; \
+                 with reconciliation disabled a claimed-but-queued job whose VM \
+                 is reaped would be stranded"
+            );
+        }
         // GitHub App JWTs, installation tokens, and JIT config requests all
         // ride this base URL with bearer credentials in the Authorization
         // header. An http:// override leaks those credentials to anyone on
