@@ -48,6 +48,9 @@ nix develop --command cargo build --release
 | `GH_API_TIMEOUT_SECS`     | Per-request HTTP timeout. Default 60.                                    |
 | `GH_API_URL`              | API base. Override for GHES.                                             |
 | `CONTROL_ADDR`            | Optional loopback HTTP control endpoint, e.g. `127.0.0.1:9100`. Unset disables it. Non-loopback is refused (no auth). See [Pausing](#pausing). |
+| `RECONCILE_ENABLED`       | Default `true`. Enables the queued-job reconciler (see [Reconciler](#reconciler)). Needs the App's `Actions: read`; startup fails fast without it. |
+| `RECONCILE_INTERVAL_SECS` | Default 60. Reconciler cadence; kept faster than `GC_INTERVAL_SECS` so a stolen job recovers promptly. |
+| `JOB_COMPLETION_CHECK`    | Default `true`. Finalize a finished runner's spool entry only after GitHub confirms its job left `queued`; log a "steal" otherwise. |
 
 ## What we accept
 
@@ -56,7 +59,7 @@ A spool entry is run iff **all** of these hold:
 - Filename is `<workflow_job_id>.job` (`u64` parses).
 - File is a regular file (not a symlink, FIFO, dir).
 - File is ≤ 6 MiB; envelope line ≤ 4 KiB.
-- `envelope.schema == 1`.
+- `envelope.schema` is 1 or 2.
 - `verify_hmac(envelope.signature, body, GH_WEBHOOK_SECRET)` passes.
 - `envelope.workflow_job_id == filename's id`.
 - `envelope.repo` is in `GH_ALLOWED_REPOS`.
@@ -87,6 +90,54 @@ from the signed body (and from the filename, which we cross-check
 against the envelope and body). A replay produces the same VM name and
 the second `limactl start` collides with the first — header data
 (`delivery`) is **not** in the identity.
+
+## Reconciler
+
+GitHub assigns a queued job to **any** online, idle runner whose label set is a
+superset of the job's labels — a JIT config does not bind a runner to a
+specific `workflow_job_id`. So a runner we mint because we saw job A's `queued`
+webhook can be handed an unrelated older queued job B in the same repo. If we
+then retired A's spool entry just because *a* runner finished, A would be
+stranded: still queued on GitHub, but its webhook spent. We avoid that with two
+mechanisms, both authoritative against GitHub rather than against our own
+webhook bookkeeping:
+
+- **Authoritative completion** (`JOB_COMPLETION_CHECK`, default on). When a
+  runner exits, we ask GitHub for its job's status before finalizing. If the
+  job left `queued` (ran somewhere, including ran-and-failed) we archive to
+  `done/`. If it's still `queued` — our runner ran someone else's job, a
+  "steal" — we still archive to `done/` (the webhook delivery is spent and
+  cannot be re-served from `new/`) and let the reconciler re-mint. On an API
+  error we fail safe toward `done/` and rely on the reconciler. **Note:**
+  `done/` therefore means "this webhook delivery is fully processed", not "this
+  job left the queue".
+
+- **Queued-job reconciler** (`RECONCILE_ENABLED`, default on). Every
+  `RECONCILE_INTERVAL_SECS`, for each allowed repo, we list still-`queued`
+  workflow_jobs from GitHub and mint a runner for any that lacks one (not
+  backed by a live `cur/` entry or an online `gha-` runner), up to
+  `MAX_CONCURRENCY`. This recovers stolen jobs, jobs whose Lima boot failed,
+  and `queued` webhooks we never received. Reconciler mints are tracked by a
+  **synthetic `cur/` record** built from authenticated API data and self-signed
+  with the webhook secret, so GC, teardown, and stale-expiry treat them like
+  any webhook-minted job. The reconciler skips while [paused](#pausing).
+
+Runners stay fungible (the webhook fast-path keeps latency low; the reconciler
+is the correctness backstop), so jobs may run in a shuffled order — but every
+queued job eventually gets a runner and nothing is falsely retired.
+
+This is the standard autoscaler model (treat GitHub's live queue as truth), so
+it needs **no workflow changes**. A per-run dynamic `runs-on` label
+(`run-${{ github.run_id }}-${{ github.run_attempt }}`) would additionally
+*confine* each runner to one run and cut the wasted shuffle, but it's an
+optional optimization, not required for correctness.
+
+### Required App permission
+
+The reconciler and completion check read workflow runs/jobs, which need the
+App's **`Actions: read`** permission — distinct from the runner-admin rights
+(`Administration: write`) used to mint and delete runners. Startup probes it
+per allowed repo and fails fast if it's missing (or set `RECONCILE_ENABLED=false`).
 
 ## GC
 

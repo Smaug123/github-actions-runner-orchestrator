@@ -10,7 +10,7 @@
 // On success the file moves to done/, on failure to error/ with a sidecar
 // `<name>.err` log next to it.
 //
-// Wire contract (envelope schema 1):
+// Wire contract (envelope schema 1 or 2):
 //   * Filename is `<workflow_job_id>.job` — a u64 from a signed body field.
 //   * Envelope JSON carries the spool's copies of signed body fields
 //     (repo_id, repo, action, workflow_job_id) plus unauthenticated header
@@ -24,7 +24,7 @@
 //     a regular file (no TOCTOU window),
 //   * cap file size and envelope-line size (defence against memory blowup),
 //   * verify HMAC-SHA256 over the body using a shared webhook secret,
-//   * require schema == 1,
+//   * require schema in 1..=2,
 //   * require the filename's workflow_job_id to match envelope.workflow_job_id,
 //   * cross-check every signed envelope field against the body it came from,
 //   * require envelope.repo to be in our allowlist.
@@ -47,7 +47,7 @@ use notify::{RecursiveMode, Watcher};
 use serde::Deserialize;
 use sha2::Sha256;
 use tokio::fs;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tracing::warn;
 
@@ -211,7 +211,7 @@ impl Spool {
 
     pub async fn finalize_done(&self, cur_path: &Path) -> Result<()> {
         let name = cur_path.file_name().context("cur path has no filename")?;
-        fs::rename(cur_path, self.done_dir().join(name))
+        archive(cur_path, &self.done_dir().join(name))
             .await
             .context("move to done/")
     }
@@ -224,10 +224,190 @@ impl Spool {
         // Best-effort sidecar; if we can't write it, still attempt the rename
         // so the file doesn't get retried on next startup.
         let _ = fs::write(&err_path, reason).await;
-        fs::rename(cur_path, self.error_dir().join(name))
+        archive(cur_path, &self.error_dir().join(name))
             .await
             .context("move to error/")
     }
+
+    /// Mint a `cur/<job_id>.job` record directly from authenticated GitHub API
+    /// data, bypassing `new/` and the HMAC ingress check. Used only by the
+    /// reconciler to track a runner it mints for a still-`queued` job whose
+    /// webhook we never claimed (e.g. it was stolen and archived, or never
+    /// arrived). The record carries an HMAC we compute ourselves so it stays
+    /// re-verifiable, and the canonical `<job_id>.job` filename means GC's
+    /// `live_vm_names_from_cur` derives the matching `vm_name(job_id)`.
+    ///
+    /// Returns `Ok(None)` when a live `cur/<job_id>.job` already exists (a
+    /// webhook claim, or a prior reconciler mint) — the exclusive rename is the
+    /// dedup. Unlike `try_claim`, this deliberately does **not** consult
+    /// `done/`/`error/`: the reconciler only mints for jobs GitHub reports as
+    /// queued *right now*, so a stale archive of the same id (e.g. from a steal
+    /// we finalized to `done/`) must not block re-minting. GitHub's queue is
+    /// authoritative here, not our local archive.
+    pub async fn write_synthetic_claim(
+        &self,
+        job: &crate::github::jit::JobStatus,
+        full_name: &str,
+        secret: &[u8],
+    ) -> Result<Option<PathBuf>> {
+        let name = format!("{}.job", job.id);
+        let dst = self.cur_dir().join(&name);
+        if fs::try_exists(&dst).await.unwrap_or(false) {
+            return Ok(None);
+        }
+        let body = serde_json::to_vec(&serde_json::json!({
+            "action": "queued",
+            "workflow_job": {
+                "id": job.id,
+                "run_id": job.run_id,
+                "run_attempt": job.run_attempt,
+                "name": job.name,
+                "labels": job.labels,
+            },
+            "repository": { "id": job.repo_id, "full_name": full_name },
+        }))
+        .context("serialize synthetic body")?;
+        let envelope = serde_json::to_vec(&serde_json::json!({
+            "schema": 2,
+            "event": "workflow_job",
+            "delivery": format!("reconciler:{}", job.id),
+            "repo_id": job.repo_id,
+            "repo": full_name,
+            "action": "queued",
+            "workflow_job_id": job.id,
+            "received_at_ms": 0,
+            "signature": sign_body(secret, &body),
+        }))
+        .context("serialize synthetic envelope")?;
+        let mut bytes = envelope;
+        bytes.push(b'\n');
+        bytes.extend_from_slice(&body);
+
+        // Stage under a temp name in cur/ (0700, ours), then exclusive-rename
+        // to the canonical name so a concurrent webhook claim can't be
+        // clobbered and a partial write is never visible as `<id>.job`. The
+        // temp name is unique per process and per attempt (pid + a nanosecond
+        // nonce) so two consumers sharing a SPOOL_DIR — a documented-safe
+        // config — never race on the same temp path; the canonical
+        // `rename_no_clobber` below remains the single dedup point. A temp left
+        // by a crashed process is harmless: it carries no `.job` suffix (so GC's
+        // `live_vm_names_from_cur` ignores it) and stale-expiry sweeps it later.
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp = self.cur_dir().join(format!(
+            ".tmp-reconcile-{}-{}-{}",
+            job.id,
+            std::process::id(),
+            nonce
+        ));
+        write_private_file(&tmp, &bytes)
+            .await
+            .with_context(|| format!("write synthetic claim {name}"))?;
+        match rename_no_clobber(&tmp, &dst) {
+            Ok(()) => {
+                stamp_claim_time(&dst);
+                Ok(Some(dst))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let _ = fs::remove_file(&tmp).await;
+                Ok(None)
+            }
+            Err(e) => {
+                let _ = fs::remove_file(&tmp).await;
+                Err(e).with_context(|| format!("synthetic claim rename {name}"))
+            }
+        }
+    }
+}
+
+/// Move `cur_path` into its archive slot `dest`, preserving any prior archive
+/// of the same `workflow_job_id` as `<dest>.<unix_millis>.bak`. The same id can
+/// be archived twice — a job stolen by another runner is finalized to `done/`,
+/// then the reconciler re-mints it and finalizes the real completion to the
+/// same `done/<id>.job`.
+///
+/// Ordering guarantees the canonical archive marker is never absent — replay
+/// protection in `try_claim` keys on `done/<id>.job` / `error/<id>.job`
+/// *existing*, not on its contents:
+///
+/// * dest free: one exclusive rename installs it.
+/// * cur_path already gone: GC (`expire_stale_cur`) or a concurrent finalize
+///   already archived this id; leave the existing marker untouched (idempotent).
+/// * dest occupied: the exclusive rename proved cur_path still exists, so
+///   preserve the old marker then install ours; if cur_path vanishes in the
+///   race window, restore the preserved copy so a marker survives.
+async fn archive(cur_path: &Path, dest: &Path) -> Result<()> {
+    match rename_no_clobber(cur_path, dest) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            warn!(cur = %cur_path.display(), "finalize: source already archived; leaving existing marker");
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let Some(bak) = preserve_existing(dest).await else {
+                // Marker vanished between the rename and now; just install ours.
+                fs::rename(cur_path, dest).await?;
+                return Ok(());
+            };
+            match fs::rename(cur_path, dest).await {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    // Our source disappeared; put the preserved marker back so
+                    // replay protection still sees an archive at `dest`.
+                    let _ = fs::rename(&bak, dest).await;
+                    Err(e).with_context(|| format!("install archive {}", dest.display()))
+                }
+            }
+        }
+        Err(e) => Err(e).with_context(|| format!("archive {}", dest.display())),
+    }
+}
+
+/// Move an existing `dest` aside to `<dest>.<unix_millis>.bak`, returning the
+/// `.bak` path (so the caller can restore it if the follow-up install fails).
+/// `None` if there was nothing to preserve or the move failed.
+async fn preserve_existing(dest: &Path) -> Option<PathBuf> {
+    if !fs::try_exists(dest).await.unwrap_or(false) {
+        return None;
+    }
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let mut bak = dest.as_os_str().to_owned();
+    bak.push(format!(".{millis}.bak"));
+    let bak = PathBuf::from(bak);
+    match fs::rename(dest, &bak).await {
+        Ok(()) => Some(bak),
+        Err(e) => {
+            warn!(dest = %dest.display(), error = %e, "could not preserve prior archive");
+            None
+        }
+    }
+}
+
+/// HMAC-SHA256 a body into the `sha256=<hex>` wire format `verify_signature`
+/// accepts. Used to self-sign reconciler-minted records.
+fn sign_body(secret: &[u8], body: &[u8]) -> String {
+    let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC accepts any key length");
+    mac.update(body);
+    format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+}
+
+/// Create `path` owner-only (0600), failing if it already exists. Mirrors the
+/// posture of `runner::write_jit_blob`.
+async fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .await?;
+    f.write_all(contents).await?;
+    f.sync_all().await?;
+    Ok(())
 }
 
 /// Set a file's mtime to the current wall clock. Best-effort: any failure is
@@ -860,5 +1040,106 @@ mod tests {
 
         let post = std::fs::metadata(&target).unwrap().modified().unwrap();
         assert_eq!(pre, post, "stamp_claim_time must not follow symlink");
+    }
+
+    #[tokio::test]
+    async fn write_synthetic_claim_creates_parseable_record() {
+        let (_dir, root) = spool_tmp().await;
+        let s = Spool::new(root.clone());
+        let job = crate::github::jit::JobStatus {
+            id: 4242,
+            status: "queued".into(),
+            run_id: 9,
+            run_attempt: 1,
+            name: "build".into(),
+            labels: vec!["self-hosted".into(), "lima-nix".into()],
+            repo_id: 7,
+        };
+        let cur = s
+            .write_synthetic_claim(&job, "o/r", b"k")
+            .await
+            .unwrap()
+            .expect("minted");
+        assert_eq!(cur, root.join("cur/4242.job"));
+        // Canonical filename -> GC derives the matching vm_name.
+        assert_eq!(parse_spool_filename("4242.job"), Some(4242));
+        let (env, body) = read_spool_file(&cur).await.unwrap();
+        assert_eq!(env.workflow_job_id, 4242);
+        assert_eq!(env.repo, "o/r");
+        assert_eq!(env.schema, 2);
+        // The self-computed HMAC re-verifies, keeping invariant #1 honest.
+        assert!(
+            verify_signature(&env.signature, &body, b"k"),
+            "self-HMAC must verify"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_synthetic_claim_skips_when_cur_exists() {
+        let (_dir, root) = spool_tmp().await;
+        let s = Spool::new(root.clone());
+        fs::write(root.join("cur/4242.job"), b"live").await.unwrap();
+        let job = crate::github::jit::JobStatus {
+            id: 4242,
+            status: "queued".into(),
+            ..Default::default()
+        };
+        let out = s.write_synthetic_claim(&job, "o/r", b"k").await.unwrap();
+        assert!(out.is_none(), "must not clobber a live cur/ claim");
+        assert_eq!(fs::read(root.join("cur/4242.job")).await.unwrap(), b"live");
+    }
+
+    #[tokio::test]
+    async fn finalize_done_preserves_existing_archive() {
+        let (_dir, root) = spool_tmp().await;
+        let s = Spool::new(root.clone());
+        // Prior archive from an earlier processing of the same id (a steal we
+        // finalized to done/), then a fresh cur/ entry (reconciler re-mint).
+        fs::write(root.join("done/77.job"), b"prior").await.unwrap();
+        fs::write(root.join("cur/77.job"), b"fresh").await.unwrap();
+        s.finalize_done(&root.join("cur/77.job")).await.unwrap();
+        assert_eq!(fs::read(root.join("done/77.job")).await.unwrap(), b"fresh");
+        let mut found_bak = false;
+        let mut rd = fs::read_dir(root.join("done")).await.unwrap();
+        while let Some(ent) = rd.next_entry().await.unwrap() {
+            let n = ent.file_name().to_string_lossy().to_string();
+            if n.starts_with("77.job.") && n.ends_with(".bak") {
+                assert_eq!(fs::read(ent.path()).await.unwrap(), b"prior");
+                found_bak = true;
+            }
+        }
+        assert!(found_bak, "prior done/ archive should be preserved as .bak");
+    }
+
+    #[tokio::test]
+    async fn finalize_keeps_marker_when_source_already_archived() {
+        // GC (expire_stale_cur) already moved the cur entry to error/. The
+        // worker then finalizes the now-missing cur path; the existing archive
+        // marker must survive (replay protection in try_claim depends on it)
+        // and no marker should be moved aside to a .bak.
+        let (_dir, root) = spool_tmp().await;
+        let s = Spool::new(root.clone());
+        fs::write(root.join("error/88.job"), b"gc-archived")
+            .await
+            .unwrap();
+        // cur/88.job does NOT exist.
+        s.finalize_error(&root.join("cur/88.job"), "boom")
+            .await
+            .unwrap();
+        assert!(
+            root.join("error/88.job").exists(),
+            "archive marker must survive a finalize whose source is already gone"
+        );
+        assert_eq!(
+            fs::read(root.join("error/88.job")).await.unwrap(),
+            b"gc-archived"
+        );
+        let mut rd = fs::read_dir(root.join("error")).await.unwrap();
+        while let Some(ent) = rd.next_entry().await.unwrap() {
+            assert!(
+                !ent.file_name().to_string_lossy().ends_with(".bak"),
+                "no marker should have been moved aside"
+            );
+        }
     }
 }

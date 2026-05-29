@@ -120,6 +120,39 @@ pub struct Config {
     /// the endpoint has no auth, so loopback is the trust boundary.
     #[arg(long, env = "CONTROL_ADDR")]
     pub control_addr: Option<String>,
+
+    /// Master switch for the queued-job reconciler. When on, a periodic pass
+    /// lists each allowed repo's still-`queued` workflow_jobs from GitHub and
+    /// mints a runner for any that lacks one — the backstop that makes us
+    /// correct despite GitHub's label-fungible runner matching (a runner we
+    /// mint for one job can be handed an unrelated queued job). Requires the
+    /// App's `Actions: read` permission; startup fails fast without it.
+    #[arg(
+        long,
+        env = "RECONCILE_ENABLED",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    pub reconcile_enabled: bool,
+
+    /// Cadence of the reconciler pass. Kept separate from (and faster than)
+    /// `GC_INTERVAL_SECS` so a stolen current-run job is re-minted promptly
+    /// without running VM/runner cleanup every minute.
+    #[arg(long, env = "RECONCILE_INTERVAL_SECS", default_value_t = 60)]
+    pub reconcile_interval_secs: u64,
+
+    /// When on, a finished runner's spool entry is finalized only after GitHub
+    /// confirms its job left `queued`; a job still queued (our runner ran some
+    /// other job) is logged as a steal. Off restores the legacy "runner exited
+    /// => done" behavior. The reconciler is the correctness backstop either
+    /// way; this keeps `done/` honest and recovers steals faster.
+    #[arg(
+        long,
+        env = "JOB_COMPLETION_CHECK",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    pub job_completion_check: bool,
 }
 
 fn default_runner_labels() -> Vec<String> {
@@ -195,6 +228,9 @@ impl Config {
         }
         if self.gc_interval_secs == 0 {
             anyhow::bail!("GC_INTERVAL_SECS must be >= 1");
+        }
+        if self.reconcile_interval_secs == 0 {
+            anyhow::bail!("RECONCILE_INTERVAL_SECS must be >= 1");
         }
         if self.job_max_runtime_secs == 0 {
             anyhow::bail!("JOB_MAX_RUNTIME_SECS must be >= 1");

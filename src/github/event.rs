@@ -17,6 +17,11 @@ pub struct WorkflowJob {
 pub struct WorkflowJobInfo {
     pub id: u64,
     pub run_id: u64,
+    /// Re-run counter for `run_id`. Present in the webhook payload since 2021;
+    /// `#[serde(default)]` keeps us decoding an older or trimmed body. Carried
+    /// for log correlation and the reconciler's synthetic spool record.
+    #[serde(default)]
+    pub run_attempt: u64,
     pub name: String,
     pub labels: Vec<String>,
 }

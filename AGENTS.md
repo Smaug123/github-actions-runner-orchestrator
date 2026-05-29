@@ -23,7 +23,8 @@ src/spool.rs       — Spool (claim/finalize), read_spool_file, DeliveryId,
                      HMAC verify, file-shape filter, mtime stamp on claim
 src/supervisor.rs  — dispatch loop; prepare() is the validation choke point
 src/runner.rs      — per-job state machine; vm_name(repo, job_id)
-src/gc.rs          — reconciler (stale cur/, orphan VMs, offline runners)
+src/gc.rs          — sweep (stale cur/, orphan VMs, offline runners) +
+                     reconcile (mint for still-queued jobs lacking a runner)
 src/control.rs     — optional loopback HTTP control endpoint (pause/resume/status)
 src/lima/mod.rs    — limactl wrapper; instance struct, timeouts, kill_on_drop
 src/github/        — App JWT, installation tokens (account-scoped), JIT mint
@@ -35,10 +36,15 @@ src/github/        — App JWT, installation tokens (account-scoped), JIT mint
 1. **HMAC re-verification on every claim.** The spool's HMAC ingress
    check protects against forged GitHub deliveries; ours protects
    against in-host tampering with `new/`. Don't drop or short-circuit
-   `verify_signature`.
+   `verify_signature`. (The reconciler's `write_synthetic_claim` records
+   never come from `new/`; they carry an HMAC we compute ourselves over
+   authenticated GitHub API data, so they stay re-verifiable.)
 2. **VM names come from signed body fields only.** Envelope/delivery is
    **not** under the HMAC. Use `runner::vm_name(repo, job_id)`;
-   `DeliveryId` is for logging and as a filename sanity check.
+   `DeliveryId` is for logging and as a filename sanity check. The
+   reconciler sources `workflow_job.id` from the authenticated Actions
+   API instead of a signed body — at least as trustworthy — and feeds it
+   through the same `vm_name`.
 3. **Repo-scoped everything.** `generate_jit_config` hits
    `/repos/{owner}/{repo}/actions/runners/generate-jitconfig`; runner
    list/delete hit `/repos/{owner}/{repo}/actions/runners`. The
@@ -53,9 +59,12 @@ src/github/        — App JWT, installation tokens (account-scoped), JIT mint
    The lstat in `enumerate_new` is the cheap filter; the post-open
    fstat closes the TOCTOU window. Don't replace the open with
    `fs::read`.
-6. **`prepare()` is the only place that validates.** New consumers of
-   spool data should go through it (or use the same primitives) so
-   the validation stack stays in one place.
+6. **`prepare()` is the only place that validates spool data.** New
+   consumers of `new/` data should go through it (or use the same
+   primitives) so the validation stack stays in one place. The
+   reconciler validates authenticated *API* data (not a spool file) and
+   so does not route through `prepare()`; it shares only the label
+   policy via `supervisor::classify_job_labels`.
 7. **Credentials live behind mode checks.** `GH_APP_PRIVATE_KEY_FILE`
    and `GH_WEBHOOK_SECRET_FILE` must have mode 0600 (g/o = 0).
    `LIMA_TEMPLATE` must not be a symlink and must not be g/o-writable.
@@ -66,7 +75,10 @@ src/github/        — App JWT, installation tokens (account-scoped), JIT mint
    `JOB_MAX_RUNTIME_SECS`.
 9. **GC truth is cur/, not memory.** A daemon restart recovers by
    reading `cur/` bodies and the live `limactl list` + GH runner list.
-   No in-process durable state.
+   No in-process durable state. Reconciler-minted runners get a real
+   `cur/` record (`write_synthetic_claim`), so they are GC-backed,
+   teardown-eligible, and stale-expiring exactly like webhook-minted
+   jobs — keep it that way rather than tracking them in memory.
 
 ## Wire contract with the spool
 
@@ -75,8 +87,8 @@ This consumer expects:
 
 - Filename: `<workflow_job_id>.job` (parsed by `parse_spool_filename`,
   which returns the u64 id).
-- Envelope `schema == 1`, fields: `schema, event, delivery, repo_id,
-  repo, action, workflow_job_id, received_at_ms, signature`.
+- Envelope `schema` in `1..=2`, fields: `schema, event, delivery,
+  repo_id, repo, action, workflow_job_id, received_at_ms, signature`.
 
 Of those, the signed (body-derived) fields are `repo_id, repo, action,
 workflow_job_id`; we cross-check each against the parsed body after

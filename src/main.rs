@@ -92,6 +92,19 @@ async fn main() -> Result<()> {
         gh.list_runners(owner, name, "gha-")
             .await
             .with_context(|| format!("startup self-check: listing runners on {repo}"))?;
+        // Both the reconciler and the completion check (spawn_job's job_status
+        // call) read workflow runs/jobs, which need the App's `Actions: read`
+        // permission — a different scope from the runner-admin rights proven
+        // above. Probe it whenever either feature is on so a missing permission
+        // fails loudly at startup rather than as recurring runtime 403s.
+        if config.reconcile_enabled || config.job_completion_check {
+            gh.list_queued_jobs(owner, name).await.with_context(|| {
+                format!(
+                    "startup self-check: listing queued jobs on {repo} (RECONCILE_ENABLED / \
+                     JOB_COMPLETION_CHECK require the App's `Actions: read` permission)"
+                )
+            })?;
+        }
     }
     tracing::info!(
         account = %config.org,

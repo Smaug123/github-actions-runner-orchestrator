@@ -45,14 +45,18 @@
 
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::Arc;
 
+use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
 use crate::config::Config;
-use crate::github::jit::GhClient;
+use crate::github::event::{Repository, WorkflowJob, WorkflowJobInfo};
+use crate::github::jit::{GhClient, JobStatus};
 use crate::lima::Lima;
 use crate::runner::vm_name;
-use crate::spool::{parse_spool_filename, sanitize_for_log};
+use crate::spool::{parse_spool_filename, sanitize_for_log, Spool};
+use crate::supervisor::{classify_job_labels, spawn_job, LabelVerdict};
 
 const VM_NAME_PREFIX: &str = "gha-";
 
@@ -148,6 +152,190 @@ async fn sweep_inner(config: &Config, gh: &GhClient, lima: &Lima) -> anyhow::Res
     Ok(())
 }
 
+/// The correctness backstop. GitHub assigns a queued job to any online idle
+/// runner whose labels are a superset of the job's, so a runner we mint for one
+/// job can be handed an unrelated queued job. This pass treats GitHub's queue
+/// as authoritative: for each allowed repo it lists still-`queued` jobs and
+/// mints a runner for any that isn't already covered by a live cur/ entry or an
+/// online runner — recovering stolen jobs, jobs whose mint failed, and jobs
+/// whose webhook we never received. Synthetic cur/ records make each mint
+/// cur/-backed so GC, teardown, and stale-expiry treat it like any other job.
+#[allow(clippy::too_many_arguments)]
+pub async fn reconcile(
+    config: &Arc<Config>,
+    gh: &Arc<GhClient>,
+    lima: &Arc<Lima>,
+    spool: &Arc<Spool>,
+    permits: &Arc<Semaphore>,
+    webhook_secret: &[u8],
+    runner_labels: &HashSet<String>,
+    paused: &tokio::sync::watch::Receiver<bool>,
+) {
+    if let Err(e) = reconcile_inner(
+        config,
+        gh,
+        lima,
+        spool,
+        permits,
+        webhook_secret,
+        runner_labels,
+        paused,
+    )
+    .await
+    {
+        warn!(error = %e, "reconcile error");
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn reconcile_inner(
+    config: &Arc<Config>,
+    gh: &Arc<GhClient>,
+    lima: &Arc<Lima>,
+    spool: &Arc<Spool>,
+    permits: &Arc<Semaphore>,
+    webhook_secret: &[u8],
+    runner_labels: &HashSet<String>,
+    paused: &tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    let cur_dir = config.spool_dir.join("cur");
+    let live = live_vm_names_from_cur(&cur_dir).await.unwrap_or_default();
+
+    for repo_full in &config.allowed_repos {
+        // Re-check pause before each repo's network I/O. The control endpoint
+        // promises a paused daemon claims no new work so operators can drain to
+        // in_flight == 0; bail out of the whole pass if pause flipped since the
+        // tick started.
+        if *paused.borrow() {
+            return Ok(());
+        }
+        let Some((owner, repo)) = repo_full.split_once('/') else {
+            warn!(repo = %sanitize_for_log(repo_full), "reconcile: allowed repo is not owner/name; skipping");
+            continue;
+        };
+        // Runners GitHub has for us, by name, that can actually pick up a
+        // queued job (`runner_can_serve`: online and idle). Our own live mints
+        // are cur/-backed (in `live`) anyway; this set only guards against an
+        // idle orphan runner from a crashed daemon, costing at most one tick of
+        // re-mint latency until GC reaps it. Offline and busy runners are
+        // excluded: neither can take the job (a busy run-once runner is already
+        // executing a — possibly stolen — job and exits after).
+        let idle: HashSet<String> = match gh.list_runners(owner, repo, VM_NAME_PREFIX).await {
+            Ok(rs) => rs
+                .into_iter()
+                .filter(|r| is_managed_vm_name(&r.name) && runner_can_serve(r))
+                .map(|r| r.name)
+                .collect(),
+            Err(e) => {
+                warn!(repo = %sanitize_for_log(repo_full), error = %e, "reconcile: list runners failed");
+                continue;
+            }
+        };
+        let queued = match gh.list_queued_jobs(owner, repo).await {
+            Ok(q) => q,
+            Err(e) => {
+                warn!(repo = %sanitize_for_log(repo_full), error = %e, "reconcile: list queued jobs failed");
+                continue;
+            }
+        };
+        for job in queued {
+            // Re-check pause right before any mint: list_runners/list_queued_jobs
+            // above can take a while, and pause may have flipped during them. A
+            // paused daemon must not spawn new work.
+            if *paused.borrow() {
+                return Ok(());
+            }
+            // Same label policy as the webhook path (prepare()).
+            if let LabelVerdict::Reject(_) =
+                classify_job_labels(&job.labels, &config.runner_label, runner_labels)
+            {
+                continue;
+            }
+            let vm = vm_name(job.id);
+            // A live cur/ entry counts as coverage. Known bounded caveat: if
+            // this job's runner was stolen and is now busy on another job,
+            // cur/<id>.job is still live yet that runner can't serve this job.
+            // We cannot add capacity here — vm_name is job-id-derived, so there
+            // is exactly one runner name and one VM per job, and both the
+            // synthetic claim and `limactl start` would collide. Recovery is
+            // deferred, not lost: when the stolen runner finishes, spawn_job's
+            // completion check sees this job still queued, frees the cur/ entry,
+            // and the next pass re-mints — bounded by that runner's runtime. The
+            // per-run `runs-on` label is the real lever to remove the shuffle.
+            if !should_mint(&vm, &live, &idle) {
+                continue;
+            }
+            // Concurrency gate: the shared semaphore (held by every in-flight
+            // job) is the source of truth. Non-blocking so we never stall the
+            // reconcile task; once full we stop this pass and pick up next tick.
+            let permit = match Arc::clone(permits).try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => return Ok(()),
+            };
+            match spool
+                .write_synthetic_claim(&job, repo_full, webhook_secret)
+                .await
+            {
+                Ok(Some(cur_path)) => {
+                    info!(vm = %vm, repo = %repo_full, job_id = job.id, run_id = job.run_id,
+                        "reconcile: minting runner for queued job with no runner");
+                    spawn_job(
+                        Arc::clone(spool),
+                        Arc::clone(config),
+                        Arc::clone(gh),
+                        Arc::clone(lima),
+                        build_event(repo_full, &job),
+                        cur_path,
+                        permit,
+                    );
+                }
+                // Raced a concurrent webhook claim for the same id; nothing to do.
+                Ok(None) => drop(permit),
+                Err(e) => {
+                    warn!(job_id = job.id, error = %e, "reconcile: write synthetic claim failed");
+                    drop(permit);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Mint iff no live cur/ entry and no idle runner already covers this VM name
+/// (which equals the job id).
+fn should_mint(vm: &str, live: &HashSet<String>, idle: &HashSet<String>) -> bool {
+    !live.contains(vm) && !idle.contains(vm)
+}
+
+/// True iff a runner can still pick up a queued job: it must be online **and**
+/// idle. A busy run-once JIT runner is already executing some (possibly stolen)
+/// job and exits after it, so it can't take another; an offline runner is a
+/// dead orphan. Counting either as coverage would wrongly suppress a re-mint
+/// and stall recovery until the unrelated job exits or GC reaps the runner.
+fn runner_can_serve(r: &crate::github::jit::Runner) -> bool {
+    r.status == "online" && !r.busy
+}
+
+/// Build the in-memory event the worker needs from an API job. `repository.id`
+/// is informational (the worker keys on full_name + job id); the synthetic
+/// spool record carries the authoritative `repo_id` straight from the API.
+fn build_event(full_name: &str, job: &JobStatus) -> WorkflowJob {
+    WorkflowJob {
+        action: "queued".to_string(),
+        workflow_job: WorkflowJobInfo {
+            id: job.id,
+            run_id: job.run_id,
+            run_attempt: job.run_attempt,
+            name: job.name.clone(),
+            labels: job.labels.clone(),
+        },
+        repository: Repository {
+            id: job.repo_id,
+            full_name: full_name.to_string(),
+        },
+    }
+}
+
 async fn expire_stale_cur(
     cur_dir: &Path,
     error_dir: &Path,
@@ -223,6 +411,68 @@ mod tests {
         // The generator always pads to 16 hex chars.
         assert!(is_managed_vm_name("gha-0000000000000001"));
         assert!(is_managed_vm_name("gha-deadbeefcafebabe"));
+    }
+
+    #[test]
+    fn should_mint_skips_cur_or_idle_coverage() {
+        let vm = vm_name(42);
+        let empty = HashSet::new();
+        assert!(should_mint(&vm, &empty, &empty));
+        let live: HashSet<String> = [vm.clone()].into_iter().collect();
+        assert!(
+            !should_mint(&vm, &live, &empty),
+            "covered by a live cur/ entry"
+        );
+        let idle: HashSet<String> = [vm.clone()].into_iter().collect();
+        assert!(
+            !should_mint(&vm, &empty, &idle),
+            "covered by an idle runner"
+        );
+    }
+
+    #[test]
+    fn runner_can_serve_requires_online_and_idle() {
+        let mk = |status: &str, busy: bool| crate::github::jit::Runner {
+            id: 1,
+            name: vm_name(1),
+            status: status.to_string(),
+            busy,
+        };
+        assert!(runner_can_serve(&mk("online", false)), "online idle serves");
+        assert!(
+            !runner_can_serve(&mk("online", true)),
+            "busy run-once runner can't take another job"
+        );
+        assert!(
+            !runner_can_serve(&mk("offline", false)),
+            "offline can't serve"
+        );
+        assert!(
+            !runner_can_serve(&mk("offline", true)),
+            "offline can't serve"
+        );
+    }
+
+    #[test]
+    fn build_event_carries_job_fields() {
+        let job = JobStatus {
+            id: 7,
+            status: "queued".into(),
+            run_id: 3,
+            run_attempt: 2,
+            name: "build".into(),
+            labels: vec!["self-hosted".into(), "lima-nix".into()],
+            repo_id: 99,
+        };
+        let ev = build_event("o/r", &job);
+        assert_eq!(ev.workflow_job.id, 7);
+        assert_eq!(ev.workflow_job.run_attempt, 2);
+        assert_eq!(ev.workflow_job.labels, vec!["self-hosted", "lima-nix"]);
+        assert_eq!(ev.repository.full_name, "o/r");
+        assert_eq!(ev.repository.id, 99);
+        // The VM name the worker will boot matches what live_vm_names_from_cur
+        // derives for the synthetic cur/ record.
+        assert_eq!(vm_name(ev.workflow_job.id), vm_name(7));
     }
 
     #[test]

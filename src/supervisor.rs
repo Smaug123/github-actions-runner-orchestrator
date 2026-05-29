@@ -4,7 +4,7 @@
 //   * the dispatcher validates each one before doing anything privileged:
 //       - filename parses as `<workflow_job_id>.job`,
 //       - file passes size and file-type caps,
-//       - envelope schema is 1,
+//       - envelope schema is 1 or 2,
 //       - HMAC matches the body using our shared webhook secret,
 //       - envelope.workflow_job_id matches the filename's id,
 //       - envelope.repo is in our allowlist,
@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tracing::{error, info, warn};
 use zeroize::Zeroizing;
 
@@ -105,6 +105,46 @@ pub async fn run(rt: Runtime) -> Result<()> {
         });
     }
 
+    // Queued-job reconciler: the correctness backstop. GitHub's runner matching
+    // is label-fungible, so a runner we mint for one job can be handed an
+    // unrelated queued job; this pass re-mints from GitHub's authoritative
+    // queue for any still-queued job that lacks a runner. Separate (faster)
+    // cadence from GC so a stolen job recovers promptly without running VM
+    // cleanup every minute. Skips while paused so a clean drain still works.
+    if config.reconcile_enabled {
+        let config = Arc::clone(&config);
+        let gh = Arc::clone(&gh);
+        let lima = Arc::clone(&lima);
+        let spool = Arc::clone(&spool);
+        let permits = Arc::clone(&permits);
+        let webhook_secret = Arc::clone(&webhook_secret);
+        let runner_labels = Arc::clone(&runner_labels);
+        let pause_rx = pause_tx.subscribe();
+        tokio::spawn(async move {
+            let mut t = tokio::time::interval(Duration::from_secs(config.reconcile_interval_secs));
+            t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                t.tick().await;
+                if *pause_rx.borrow() {
+                    continue;
+                }
+                // reconcile re-checks `pause_rx` before each repo's I/O and
+                // before each mint, so a pause landing mid-pass can't spawn work.
+                crate::gc::reconcile(
+                    &config,
+                    &gh,
+                    &lima,
+                    &spool,
+                    &permits,
+                    &webhook_secret,
+                    &runner_labels,
+                    &pause_rx,
+                )
+                .await;
+            }
+        });
+    }
+
     'dispatch: while let Some(name) = rx.recv().await {
         // Acquire a permit while honoring pause. Two rules:
         //
@@ -155,47 +195,30 @@ pub async fn run(rt: Runtime) -> Result<()> {
                 delivery,
                 event,
             } => {
-                let vm_name = crate::runner::vm_name_for_event(&event);
                 // delivery is the unauthenticated X-GitHub-Delivery from the
                 // envelope; workflow_job.name and repository.full_name are
                 // authenticated but author-controlled. Sanitize all three so
                 // a maliciously-named workflow or a forged envelope can't
                 // smuggle control characters into structured log output.
                 info!(
-                    vm = %vm_name,
+                    vm = %crate::runner::vm_name_for_event(&event),
                     delivery = %sanitize_for_log(&delivery),
                     repo = %sanitize_for_log(&event.repository.full_name),
                     job = %sanitize_for_log(&event.workflow_job.name),
                     run_id = event.workflow_job.run_id,
+                    run_attempt = event.workflow_job.run_attempt,
                     job_id = event.workflow_job.id,
                     "claiming job"
                 );
-                let spool2 = Arc::clone(&spool);
-                let config2 = Arc::clone(&config);
-                let gh2 = Arc::clone(&gh);
-                let lima2 = Arc::clone(&lima);
-                tokio::spawn(async move {
-                    let _permit = permit;
-                    let cur_path = cur_path;
-                    let vm_for_log = vm_name.clone();
-                    let job = Job { event };
-                    match run_job(job, config2, gh2, lima2).await {
-                        Ok(()) => {
-                            info!(vm = %vm_for_log, "job ok");
-                            if let Err(e) = spool2.finalize_done(&cur_path).await {
-                                error!(error = %e, "finalize_done failed");
-                            }
-                        }
-                        Err(e) => {
-                            error!(vm = %vm_for_log, error = %format!("{e:#}"), "job failed");
-                            if let Err(fe) =
-                                spool2.finalize_error(&cur_path, &format!("{e:#}")).await
-                            {
-                                error!(error = %fe, "finalize_error failed");
-                            }
-                        }
-                    }
-                });
+                spawn_job(
+                    Arc::clone(&spool),
+                    Arc::clone(&config),
+                    Arc::clone(&gh),
+                    Arc::clone(&lima),
+                    event,
+                    cur_path,
+                    permit,
+                );
             }
             Prepared::Drop { cur_path, reason } => {
                 info!(file = %sanitize_for_log(&name), reason = %sanitize_for_log(&reason), "dropping (not for us)");
@@ -363,45 +386,149 @@ async fn prepare(
             reason: format!("action={}", event.action),
         };
     }
-    if !event
-        .workflow_job
-        .labels
-        .iter()
-        .any(|l| l == &config.runner_label)
-    {
-        return Prepared::Drop {
-            cur_path,
-            reason: format!(
-                "labels {:?} do not include {}",
-                event.workflow_job.labels, config.runner_label
-            ),
-        };
-    }
-    // Every workflow-requested label must be in our advertised set. This is
-    // the boundary that stops a workflow file from minting a runner labeled
-    // `prod`, `gpu`, or other policy-bearing names we didn't intend to
-    // advertise. A miss is a Drop (some other factory might handle it) but
-    // if you'd rather log loudly, it's worth promoting to Reject in operator
-    // policies that care.
-    if let Some(unknown) = event
-        .workflow_job
-        .labels
-        .iter()
-        .find(|l| !runner_labels.contains(l.as_str()))
-    {
-        return Prepared::Drop {
-            cur_path,
-            reason: format!(
-                "label {:?} not in advertised set {:?}",
-                unknown, config.runner_labels
-            ),
-        };
+    // Shared label policy: the gate label must be present and every requested
+    // label must be in the advertised set — the boundary that stops a workflow
+    // file from minting a runner labeled `prod`, `gpu`, or other policy-bearing
+    // names we didn't intend to advertise. The reconciler applies the same
+    // predicate to API-discovered jobs. A miss is a Drop (some other factory
+    // might handle it); promote to Reject in operator policies that care.
+    match classify_job_labels(
+        &event.workflow_job.labels,
+        &config.runner_label,
+        runner_labels,
+    ) {
+        LabelVerdict::Accept => {}
+        LabelVerdict::Reject(reason) => return Prepared::Drop { cur_path, reason },
     }
     Prepared::Run {
         cur_path,
         delivery: env.delivery,
         event,
     }
+}
+
+/// Verdict of the shared label policy.
+pub(crate) enum LabelVerdict {
+    Accept,
+    /// Not for us: the gate label is missing, or a requested label is outside
+    /// the advertised set. The string is a log-ready reason.
+    Reject(String),
+}
+
+/// The label policy shared by `prepare()` (spool path) and the reconciler (API
+/// path): the gate label must be present, and every requested label must be in
+/// the advertised set. Pulling it out of `prepare()` keeps the policy in one
+/// place even though the reconciler validates authenticated API data rather
+/// than spool data (so it legitimately does not route through `prepare()`).
+pub(crate) fn classify_job_labels(
+    labels: &[String],
+    runner_label: &str,
+    runner_labels: &HashSet<String>,
+) -> LabelVerdict {
+    if !labels.iter().any(|l| l == runner_label) {
+        return LabelVerdict::Reject(format!("labels {labels:?} do not include {runner_label}"));
+    }
+    if let Some(unknown) = labels.iter().find(|l| !runner_labels.contains(l.as_str())) {
+        return LabelVerdict::Reject(format!("label {unknown:?} not in advertised set"));
+    }
+    LabelVerdict::Accept
+}
+
+/// What to do with a finished runner's spool entry, decided from the job's
+/// authoritative GitHub status.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CompletionAction {
+    /// The job left the queue (ran somewhere, including ran-and-failed), or its
+    /// status is unknown/unreadable. Finalize to done/.
+    Done,
+    /// The job is still queued: our runner ran some *other* job (GitHub's
+    /// label matching is fungible). The webhook is spent regardless, so we
+    /// still finalize to done/; the reconciler re-mints from authoritative
+    /// state. Distinguished only for logging.
+    Steal,
+}
+
+/// Map a GitHub job status (`None` = 404 / unknown) to a completion action.
+/// Only an explicit `queued` is a steal; everything else (including unknown)
+/// fails safe toward Done so we never double-run — the reconciler is the
+/// non-lossy backstop for a job that really is still queued.
+pub(crate) fn completion_action(status: Option<&str>) -> CompletionAction {
+    match status {
+        Some("queued") => CompletionAction::Steal,
+        _ => CompletionAction::Done,
+    }
+}
+
+async fn completion_action_via_api(
+    gh: &GhClient,
+    owner_repo: &str,
+    job_id: u64,
+) -> CompletionAction {
+    let Some((owner, repo)) = owner_repo.split_once('/') else {
+        return CompletionAction::Done;
+    };
+    match gh.job_status(owner, repo, job_id).await {
+        Ok(opt) => completion_action(opt.as_ref().map(|s| s.status.as_str())),
+        Err(e) => {
+            warn!(job_id, error = %format!("{e:#}"), "job status check failed; finalizing done (reconciler is the backstop)");
+            CompletionAction::Done
+        }
+    }
+}
+
+/// Spawn the per-job worker: run the job in a VM, then finalize its spool
+/// entry. Shared by the webhook dispatch path and the reconciler. The caller
+/// must hand over an owned permit; it is released when the job finishes.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_job(
+    spool: Arc<Spool>,
+    config: Arc<Config>,
+    gh: Arc<GhClient>,
+    lima: Arc<Lima>,
+    event: WorkflowJob,
+    cur_path: std::path::PathBuf,
+    permit: OwnedSemaphorePermit,
+) {
+    let vm_for_log = crate::runner::vm_name_for_event(&event);
+    let owner_repo = event.repository.full_name.clone();
+    let our_job_id = event.workflow_job.id;
+    let completion_check = config.job_completion_check;
+    tokio::spawn(async move {
+        let _permit = permit;
+        let cur_path = cur_path;
+        let job = Job { event };
+        match run_job(job, Arc::clone(&config), Arc::clone(&gh), lima).await {
+            Ok(()) => {
+                let action = if completion_check {
+                    completion_action_via_api(&gh, &owner_repo, our_job_id).await
+                } else {
+                    CompletionAction::Done
+                };
+                match action {
+                    CompletionAction::Done => info!(vm = %vm_for_log, "job ok"),
+                    // Finalizing here means "this webhook delivery is fully
+                    // processed" (a runner was minted and ran a job), NOT "our
+                    // job left the queue" — it may still be queued, and the
+                    // reconciler re-mints it. done/ (not error/) because
+                    // nothing went wrong.
+                    CompletionAction::Steal => warn!(
+                        vm = %vm_for_log,
+                        job_id = our_job_id,
+                        "runner finished but our job is still queued (stolen by another job); reconciler will re-mint"
+                    ),
+                }
+                if let Err(e) = spool.finalize_done(&cur_path).await {
+                    error!(error = %e, "finalize_done failed");
+                }
+            }
+            Err(e) => {
+                error!(vm = %vm_for_log, error = %format!("{e:#}"), "job failed");
+                if let Err(fe) = spool.finalize_error(&cur_path, &format!("{e:#}")).await {
+                    error!(error = %fe, "finalize_error failed");
+                }
+            }
+        }
+    });
 }
 
 fn validate_envelope(
@@ -805,6 +932,45 @@ mod tests {
         )
         .await;
         assert!(matches!(p, Prepared::Reject { ref reason, .. } if reason.contains("schema")));
+    }
+
+    #[test]
+    fn classify_job_labels_accepts_gate_and_subset() {
+        let v = classify_job_labels(
+            &["self-hosted".into(), "lima-nix".into()],
+            "lima-nix",
+            &test_labels(),
+        );
+        assert!(matches!(v, LabelVerdict::Accept));
+    }
+
+    #[test]
+    fn classify_job_labels_drops_missing_gate() {
+        let v = classify_job_labels(&["self-hosted".into()], "lima-nix", &test_labels());
+        assert!(matches!(v, LabelVerdict::Reject(ref r) if r.contains("lima-nix")));
+    }
+
+    #[test]
+    fn classify_job_labels_drops_unknown_label() {
+        let v = classify_job_labels(
+            &["self-hosted".into(), "lima-nix".into(), "prod".into()],
+            "lima-nix",
+            &test_labels(),
+        );
+        assert!(matches!(v, LabelVerdict::Reject(ref r) if r.contains("prod")));
+    }
+
+    #[test]
+    fn completion_action_maps_status() {
+        assert_eq!(completion_action(Some("queued")), CompletionAction::Steal);
+        assert_eq!(
+            completion_action(Some("in_progress")),
+            CompletionAction::Done
+        );
+        // ran-and-failed: the job left the queue, so Done (not a steal).
+        assert_eq!(completion_action(Some("completed")), CompletionAction::Done);
+        // 404 / unknown: fail safe toward Done.
+        assert_eq!(completion_action(None), CompletionAction::Done);
     }
 
     impl std::fmt::Debug for Prepared {
