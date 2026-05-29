@@ -1,4 +1,5 @@
-// Loopback HTTP control endpoint: pause/resume claiming and report status.
+// Loopback HTTP control endpoint: pause/resume claiming and report status,
+// plus a tiny embedded web UI (`/` + `/app.js`) over the same JSON API.
 //
 // "Pause" stops the supervisor claiming *new* jobs (they wait in new/);
 // in-flight VMs and the GC keep running. The primary use is a clean
@@ -7,13 +8,16 @@
 //
 // No auth: the endpoint must bind a loopback address (enforced in Config), so
 // the host boundary is the trust boundary. Pausing is the only state it can
-// change, and it can't exfiltrate anything sensitive.
+// change, and it can't exfiltrate anything sensitive. The UI is just a client
+// for that same API, so it widens no capability.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use axum::extract::State;
+use axum::http::header;
+use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Serialize;
@@ -67,8 +71,23 @@ async fn resume(State(s): State<ControlState>) -> Json<Status> {
     Json(s.status())
 }
 
+// The UI is two static assets baked into the binary; no filesystem, no extra
+// deps. The JS client drives the JSON API above.
+async fn index() -> Html<&'static str> {
+    Html(include_str!("web/index.html"))
+}
+
+async fn app_js() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("web/app.js"),
+    )
+}
+
 fn router(state: ControlState) -> Router {
     Router::new()
+        .route("/", get(index))
+        .route("/app.js", get(app_js))
         .route("/status", get(get_status))
         .route("/pause", post(pause))
         .route("/resume", post(resume))
@@ -172,5 +191,33 @@ mod tests {
 
         let v = post(format!("{base}/resume")).await;
         assert_eq!(v["paused"], serde_json::json!(false));
+    }
+
+    // The UI assets must actually serve (guarding the include_str! paths) with
+    // content types a browser will render as HTML / execute as a script.
+    #[tokio::test]
+    async fn serves_embedded_ui() {
+        let (s, _rx) = state(2);
+        let listener = bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { serve(listener, s).await.unwrap() });
+
+        let base = format!("http://{addr}");
+        let http = reqwest::Client::new();
+
+        let r = http.get(format!("{base}/")).send().await.unwrap();
+        assert_eq!(r.status(), 200);
+        let ct = r.headers()[reqwest::header::CONTENT_TYPE].to_str().unwrap();
+        assert!(ct.starts_with("text/html"), "content-type was {ct:?}");
+        assert!(r.text().await.unwrap().contains("<html"));
+
+        let r = http.get(format!("{base}/app.js")).send().await.unwrap();
+        assert_eq!(r.status(), 200);
+        let ct = r.headers()[reqwest::header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(ct.contains("javascript"), "content-type was {ct:?}");
+        assert!(!r.text().await.unwrap().is_empty());
     }
 }

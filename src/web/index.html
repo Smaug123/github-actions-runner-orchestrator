@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>gh-actions-consumer</title>
+  <style>
+    :root {
+      --bg: #0d1117; --card: #161b22; --border: #30363d;
+      --fg: #e6edf3; --muted: #8b949e;
+      --green: #3fb950; --amber: #d29922; --red: #f85149; --accent: #2f81f7;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+      background: var(--bg); color: var(--fg);
+      font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+    }
+    .card {
+      width: min(420px, 92vw); background: var(--card);
+      border: 1px solid var(--border); border-radius: 12px; padding: 28px;
+    }
+    h1 { margin: 0 0 4px; font-size: 16px; font-weight: 600; }
+    .sub { margin: 0 0 24px; color: var(--muted); font-size: 13px; }
+    .badge {
+      display: inline-flex; align-items: center; gap: 8px;
+      font-size: 20px; font-weight: 600; margin-bottom: 20px;
+    }
+    .dot { width: 12px; height: 12px; border-radius: 50%; background: var(--muted); }
+    .badge.running .dot { background: var(--green); box-shadow: 0 0 8px var(--green); }
+    .badge.paused  .dot { background: var(--amber); box-shadow: 0 0 8px var(--amber); }
+    .badge.stale   .dot { background: var(--red); }
+    .meter-label { display: flex; justify-content: space-between; font-size: 13px; color: var(--muted); margin-bottom: 6px; }
+    .meter-label b { color: var(--fg); font-variant-numeric: tabular-nums; }
+    .meter { height: 8px; background: var(--bg); border: 1px solid var(--border); border-radius: 999px; overflow: hidden; }
+    .meter > span { display: block; height: 100%; width: 0; background: var(--accent); transition: width .3s ease; }
+    .buttons { display: flex; gap: 12px; margin-top: 24px; }
+    button {
+      flex: 1; padding: 10px; border-radius: 8px; border: 1px solid var(--border);
+      background: #21262d; color: var(--fg); font-size: 14px; font-weight: 600; cursor: pointer;
+    }
+    button:hover:not(:disabled) { border-color: var(--accent); }
+    button:disabled { opacity: .4; cursor: default; }
+    #pause:not(:disabled)  { color: var(--amber); }
+    #resume:not(:disabled) { color: var(--green); }
+    .foot { display: flex; justify-content: space-between; margin-top: 18px; font-size: 12px; color: var(--muted); }
+    .err { color: var(--red); }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <h1>gh-actions-consumer</h1>
+    <p class="sub">runner supervisor control</p>
+
+    <div id="badge" class="badge"><span class="dot"></span><span id="badge-text">connecting…</span></div>
+
+    <div class="meter-label"><span>in flight</span><b><span id="in-flight">–</span> / <span id="max">–</span></b></div>
+    <div class="meter"><span id="meter-fill"></span></div>
+
+    <div class="buttons">
+      <button id="pause">Pause</button>
+      <button id="resume">Resume</button>
+    </div>
+
+    <div class="foot">
+      <span id="error" class="err"></span>
+      <span id="updated"></span>
+    </div>
+  </main>
+  <script src="/app.js" defer></script>
+</body>
+</html>
