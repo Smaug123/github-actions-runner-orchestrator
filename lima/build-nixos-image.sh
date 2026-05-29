@@ -28,7 +28,29 @@ outdir="$(cd "$outdir" && pwd)"
 echo ">> Building .#gha-guest-image (offloads aarch64-linux to the linux-builder)..."
 # --no-link: we copy the artifact out ourselves below, so we don't want a
 # result symlink rooting the (large) store path in the repo.
-store_out="$(nix build "$repo#gha-guest-image" --no-link --print-out-paths --print-build-logs)"
+#
+# Retry once: the aarch64 build offloads to host-setup/linux-builder, which has
+# intermittently presented a just-built store path as valid-but-absent (a
+# transient builder-store inconsistency that self-clears on a rerun). Bounded to
+# 2 attempts so a genuine build failure still surfaces quickly.
+attempts=2
+attempt=1
+store_out=""
+while :; do
+  if store_out="$(nix build "$repo#gha-guest-image" --no-link --print-out-paths --print-build-logs)"; then
+    break
+  fi
+  if [ "$attempt" -ge "$attempts" ]; then
+    echo "error: nix build failed after $attempts attempts." >&2
+    echo "  If it cites a store path the builder reports valid-but-absent, repair" >&2
+    echo "  the builder store and re-run:" >&2
+    echo "    ssh -F host-setup/linux-builder/ssh_config linux-builder \\" >&2
+    echo "        'nix-store --verify --check-contents --repair'" >&2
+    exit 1
+  fi
+  echo ">> nix build failed (attempt $attempt/$attempts); retrying..." >&2
+  attempt=$((attempt + 1))
+done
 
 # systemd-repart's output is a directory holding gha-guest.raw; be tolerant of
 # it being the file directly or a differently-named *.raw.
@@ -55,6 +77,23 @@ echo ">> Copying image out of the Nix store -> $img ..."
 # leave a half-written image in place.
 install -m 0644 "$img_src" "$img.tmp"
 mv -f "$img.tmp" "$img"
+
+# Defense in depth on top of nix/guest.nix's in-derivation verification: re-read
+# the UKI straight from the staged image's ESP so a corrupt copy-out (or any
+# future regression that slips past the build) fails here, before we advertise
+# the image — not at the next VM boot. util-linux's sfdisk is Linux-only, so on
+# this Darwin host find the ESP start sector with gptfdisk (EF00 = ESP) and read
+# the FAT with mtools, both via nix shell (same pattern as qemu-img elsewhere).
+# ukiFile mirrors config.system.boot.loader.ukiFile in nix/guest.nix.
+echo ">> Smoke-checking the staged image's ESP contains the UKI..."
+ukiFile="nixos.efi"
+esp_start="$(nix shell nixpkgs#gptfdisk -c sgdisk -p "$img" | awk '$6=="EF00"{print $2; exit}')"
+case "$esp_start" in
+  "" | *[!0-9]*) echo "error: could not find an ESP (EF00) partition in $img" >&2; exit 1 ;;
+esac
+nix shell nixpkgs#mtools -c mdir -i "$img@@$((esp_start * 512))" "::/EFI/Linux/$ukiFile" >/dev/null 2>&1 \
+  || { echo "error: UKI ($ukiFile) missing from the staged image's ESP" >&2; exit 1; }
+echo ">> ESP smoke check passed."
 
 digest="sha256:$(shasum -a 256 "$img" | awk '{print $1}')"
 echo ">> Image digest: $digest"

@@ -92,9 +92,15 @@ in
         repartConfig = {
           Type = "esp";
           Format = "vfat";
-          # The UKI (kernel+initrd) is ~86M, so keep the ESP roomy. We copy the
-          # UKI into the FAT image in postBuild below because repart's vfat
-          # CopyFiles path silently dropped it while reporting success.
+          # Keep the ESP at 512M for two independent reasons, both of which
+          # silently produce an unbootable image if violated:
+          #   1. FAT cluster minimum: mkfs.vfat builds a malformed filesystem
+          #      below ~32M (too few clusters), which some UEFI firmwares (vz's
+          #      included) reject — empty serial, VM halts a few seconds in.
+          #   2. UKI headroom: the UKI (kernel+initrd) is ~86M and must fit whole.
+          # We also copy the UKI into the FAT image in postBuild below rather than
+          # via repart's contents/CopyFiles, because that path silently dropped it
+          # while reporting success (see the postBuild override and its verify).
           SizeMinBytes = "512M";
         };
       };
@@ -111,16 +117,58 @@ in
   };
 
   system.build.image = lib.mkForce (config.image.repart.image.overrideAttrs (old: {
+    # sfdisk (util-linux) + jq locate the ESP from the partition table; mtools
+    # does the FAT copy/verify. mtools is already on PATH for the vfat partition,
+    # but list it so this override does not depend on that implementation detail.
+    nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [
+      pkgs.util-linux
+      pkgs.jq
+      pkgs.mtools
+      pkgs.coreutils
+    ];
     postBuild = (old.postBuild or "") + ''
       echo "Copying UKI into ESP..."
-      esp=${config.image.baseName}.raw@@1048576
+      img=${config.image.baseName}.raw
+      uki=${config.system.build.uki}/${config.system.boot.loader.ukiFile}
+
+      # Fail loudly if the UKI input is not where we expect, rather than baking
+      # an empty, unbootable ESP. Two causes seen/anticipated: a future nixpkgs
+      # change to system.build.uki's layout (today a dir holding
+      # ${config.system.boot.loader.ukiFile}), or the input store path being
+      # GC'd off the builder mid-build (auto-GC has raced this build; the
+      # lima/build-nixos-image.sh retry recovers — see linux-builder/README.md).
+      [ -f "$uki" ] || { echo "error: UKI not found at $uki (build.uki layout changed, or input GC'd on the builder?)" >&2; exit 1; }
+
+      # Locate the ESP by its GPT type GUID instead of assuming repart's default
+      # 1 MiB first-partition offset: if repart's alignment/padding ever changes,
+      # a hard-coded offset would make mtools silently target the wrong region.
+      esp_guid=C12A7328-F81F-11D2-BA4B-00A0C93EC93B
+      esp_start=$(sfdisk -J "$img" | jq -r --arg g "$esp_guid" \
+        '.partitiontable.partitions[] | select((.type | ascii_upcase) == $g) | .start')
+      case "$esp_start" in
+        "" | *[!0-9]*) echo "error: could not locate ESP (type $esp_guid) in $img" >&2; exit 1 ;;
+      esac
+      esp="$img@@$(( esp_start * ${toString config.image.repart.sectorSize} ))"
+
       if ! mdir -i "$esp" ::/EFI/Linux >/dev/null 2>&1; then
         mmd -i "$esp" ::/EFI/Linux
       fi
-      mcopy -o -i "$esp" \
-        ${config.system.build.uki}/${config.system.boot.loader.ukiFile} \
-        ::/EFI/Linux/${config.system.boot.loader.ukiFile}
-      mdir -i "$esp" ::/EFI/Linux/${config.system.boot.loader.ukiFile} >/dev/null
+      mcopy -o -i "$esp" "$uki" ::/EFI/Linux/${config.system.boot.loader.ukiFile}
+
+      # Verify the copy actually landed: repart's own vfat CopyFiles reported
+      # success while dropping the UKI, so re-read it straight from the FAT and
+      # fail the build on any miss (absent / truncated / not a PE image) instead
+      # of shipping an appliance that builds clean but does not boot.
+      mdir -i "$esp" ::/EFI/Linux/${config.system.boot.loader.ukiFile} >/dev/null \
+        || { echo "error: UKI absent from ESP after copy" >&2; exit 1; }
+      check=$(mktemp)
+      mcopy -o -i "$esp" ::/EFI/Linux/${config.system.boot.loader.ukiFile} "$check"
+      want=$(stat -c %s "$uki")
+      got=$(stat -c %s "$check")
+      [ "$got" -ge "$want" ] || { echo "error: ESP UKI truncated ($got < $want bytes)" >&2; exit 1; }
+      [ "$(head -c 2 "$check")" = "MZ" ] || { echo "error: ESP UKI is not a PE image" >&2; exit 1; }
+      rm -f "$check"
+      echo "UKI verified in ESP: /EFI/Linux/${config.system.boot.loader.ukiFile} ($got bytes)."
     '';
   }));
 

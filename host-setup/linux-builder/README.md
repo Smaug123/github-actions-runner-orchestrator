@@ -50,3 +50,24 @@ The host key is the well-known public nix-darwin builder key — not a secret.
 
 The builder VM only runs while the `nix run` terminal is open. A launchd plist
 to keep it running across reboots is a planned follow-up.
+
+## Troubleshooting
+
+**Build fails citing a "valid but missing"/absent store path.** Occasionally a
+guest-image build (`lima/build-nixos-image.sh`) fails referencing a store path
+that is absent from the builder's store — a transient builder-store
+inconsistency. One observed cause: the builder runs Nix **auto-GC mid-build**
+and deletes a path the in-flight derivation depends on (e.g. the UKI input),
+after which the build aborts. `nix/guest.nix` asserts its inputs so this fails
+loudly instead of producing an unbootable image, and the build script retries
+once — which recopies the inputs and usually clears it. If it persists, repair
+the builder's store and re-run (the `linux-builder` alias comes from the
+installed `ssh_config`; before `install.sh`, use
+`-F host-setup/linux-builder/ssh_config`):
+
+    ssh linux-builder 'nix-store --verify --check-contents --repair'
+
+`--repair` re-fetches or rebuilds any path whose contents are missing or
+corrupt; then re-run the build. If auto-GC races builds frequently, raise the
+builder VM's `min-free`/`max-free` or its disk size so GC is not triggered
+during a build.
