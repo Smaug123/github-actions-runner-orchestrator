@@ -230,6 +230,29 @@ in
   # trusted-user (which would let untrusted job code add arbitrary caches).
   nix.settings.experimental-features = [ "nix-command" "flakes" ];
 
+  # Phase 3 (3b): add the Mac signing cache as an EXTRA substituter so jobs fetch
+  # warm, signed aarch64-linux paths from the host ahead of cache.nixos.org.
+  #
+  # Use `extra-substituters` / `extra-trusted-public-keys`, NOT the bare
+  # `substituters` / `trusted-public-keys`: the bare options REPLACE NixOS's
+  # defaults, which would silently drop cache.nixos.org and its signing key and
+  # break fallback for anything the Mac hasn't warmed. The `extra-*` forms append
+  # to the defaults, so the final config trusts BOTH keys and queries BOTH caches.
+  #
+  # Reachability: the URL is the Lima usernet name host.lima.internal, which the
+  # in-process usernet gateway forwards to the host's loopback-bound darkhttpd
+  # (see host-setup/mac-cache). Plain HTTP is fine — integrity comes from the
+  # narinfo signature verified against the key below, not from the transport; an
+  # unreachable cache (server down / not yet deployed) just fast-fails to
+  # cache.nixos.org. The Mac cache advertises `Priority: 10` (< cache.nixos.org's
+  # 40), so it WINS for any path present in both — substituter list order is not
+  # preference. Baked into the system config (not added per job) so the runner
+  # stays a non-trusted daemon user.
+  nix.settings.extra-substituters = [ "http://host.lima.internal:8080" ];
+  nix.settings.extra-trusted-public-keys = [
+    "gha-mac-cache-1:b2Z+TC5MgDzPdvNOLm5RB9NAAQV5r7Emi6his95XR+s="
+  ];
+
   # Ephemeral, single-job VM: stateVersion only governs stateful-service
   # migration semantics we never hit, so track the pinned nixpkgs.
   system.stateVersion = config.system.nixos.release;
