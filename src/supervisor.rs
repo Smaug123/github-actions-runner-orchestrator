@@ -411,8 +411,8 @@ fn validate_envelope(
     allowed_repos: &HashSet<String>,
     filename_job_id: u64,
 ) -> Option<String> {
-    if env.schema != 1 {
-        return Some(format!("schema={} (expected 1)", env.schema));
+    if !(1..=2).contains(&env.schema) {
+        return Some(format!("schema={} (expected 1 or 2)", env.schema));
     }
     if !verify_signature(&env.signature, body, secret) {
         return Some("hmac signature mismatch".to_string());
