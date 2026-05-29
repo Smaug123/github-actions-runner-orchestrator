@@ -86,18 +86,15 @@ in
         contents = {
           "/EFI/BOOT/BOOT${lib.toUpper efiArch}.EFI".source =
             "${pkgs.systemd}/lib/systemd/boot/efi/systemd-boot${efiArch}.efi";
-          "/EFI/Linux/${config.system.boot.loader.ukiFile}".source =
-            "${config.system.build.uki}/${config.system.boot.loader.ukiFile}";
           # Boot the single UKI immediately, no menu.
           "/loader/loader.conf".source = pkgs.writeText "loader.conf" "timeout 0\n";
         };
         repartConfig = {
           Type = "esp";
           Format = "vfat";
-          # The UKI (kernel+initrd) is ~86M and must fit here in full; at a
-          # tight 96M ESP, repart's vfat copy of the UKI silently failed,
-          # leaving a UKI-less, unbootable ESP (systemd-boot then finds nothing
-          # in /EFI/Linux and vz halts). Give it generous headroom.
+          # The UKI (kernel+initrd) is ~86M, so keep the ESP roomy. We copy the
+          # UKI into the FAT image in postBuild below because repart's vfat
+          # CopyFiles path silently dropped it while reporting success.
           SizeMinBytes = "512M";
         };
       };
@@ -112,6 +109,20 @@ in
       };
     };
   };
+
+  system.build.image = lib.mkForce (config.image.repart.image.overrideAttrs (old: {
+    postBuild = (old.postBuild or "") + ''
+      echo "Copying UKI into ESP..."
+      esp=${config.image.baseName}.raw@@1048576
+      if ! mdir -i "$esp" ::/EFI/Linux >/dev/null 2>&1; then
+        mmd -i "$esp" ::/EFI/Linux
+      fi
+      mcopy -o -i "$esp" \
+        ${config.system.build.uki}/${config.system.boot.loader.ukiFile} \
+        ::/EFI/Linux/${config.system.boot.loader.ukiFile}
+      mdir -i "$esp" ::/EFI/Linux/${config.system.boot.loader.ukiFile} >/dev/null
+    '';
+  }));
 
   # --- Lima boot contract: cloud-init NoCloud from the cidata disk ---
   # NoCloud auto-detects the `cidata` disk by label; pinning the datasource
