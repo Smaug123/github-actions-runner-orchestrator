@@ -22,7 +22,16 @@
 
         craneLib = (crane.mkLib pkgs).overrideToolchain (_: rustToolchain);
 
-        src = craneLib.cleanCargoSource ./.;
+        # control.rs embeds the web-UI assets at compile time via include_str!,
+        # but crane's default filter keeps only Cargo/Rust files and would drop
+        # src/web/*, breaking `nix build`. Union the web assets back in beside
+        # the usual cargo sources.
+        src = pkgs.lib.cleanSourceWith {
+          src = ./.;
+          filter = path: type:
+            (pkgs.lib.hasInfix "/src/web/" path) || (craneLib.filterCargoSources path type);
+          name = "source";
+        };
 
         commonArgs = {
           inherit src;
