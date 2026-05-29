@@ -224,11 +224,18 @@ in
 
   # Minimal job toolchain: the runner itself, gha-run-once, plus git + node
   # for actions/checkout and node-based actions.
+  #
+  # minio-client (`mc`) is the artifact transport to the self-hosted Mac S3 store
+  # (host-setup/mac-cache-s3): the workflow's `mc cp` steps push/pull the per-run
+  # job→job bundle over host.lima.internal instead of GitHub artifact storage.
+  # The build *cache* needs nothing here — tespkg/actions-cache is a node24 JS
+  # action that carries its own S3 client.
   environment.systemPackages = [
     gha-run-once
     github-runner
     pkgs.git
     pkgs.nodejs_24
+    pkgs.minio-client
   ];
 
   # Nix is provided by the OS here, so workflows must NOT run the Determinate
