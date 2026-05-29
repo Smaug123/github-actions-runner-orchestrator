@@ -23,22 +23,25 @@ domain"). Segmenting per-repo is deferred (`DEFERRED.md`).
 - **slice 2a: confined static server + serve-start gate.** `serve-cache.sh` +
   `common.sh` (shared layout, so the gate checks the same key path the writer
   created).
-- **slice 2b (this commit): deploy under launchd + tests.** `setup-server.sh`
+- **slice 2b: deploy under launchd + tests.** `setup-server.sh`
   (creates the `_gha-cache` user, installs/loads the LaunchDaemon, asserts the
   user can't read the key) and `test-cache.sh` (the (+)/(−) harness). Binds
   **loopback** — see "Deploying the server" for why that, not a `pf`-fenced LAN
   address.
+- **slice 3 (this commit): warm the cache.** `warm-cache.sh <target>...` copies
+  the full signed **build closure** into the docroot (see "Warming the cache").
+- **3b (guest config, in `nix/guest.nix`):** the guest's `nix.settings` appends
+  this cache + its public key via `extra-substituters` /
+  `extra-trusted-public-keys`, keeping `cache.nixos.org` and its key.
 
-Still to come (separate slices):
+Still to come:
 
-- `warm-cache.sh <flake-target>`: `nix copy` the full **build closure** (not
-  just outputs — outputs-only misses `cargoArtifacts`) into the docroot, force
-  `aarch64-linux`, record a manifest, prune behind a host-level lock.
-- Guest substituter config (`nix/guest.nix`, 3b): add this cache + its public
-  key while **keeping** `cache.nixos.org` and its default key.
+- **Prune** (a `warm-cache.sh` follow-up): delete stale NARs behind the host
+  lock, gated on a GC-truth precondition (no `gha-*` Lima VMs + empty spool) and
+  a delete-vs-live-fetch grace window. Deliberately not in this slice.
 
-The automatic host warmer (3c) is deferred — v1 is populated manually by your
-own dev `nix copy`s, with `cache.nixos.org` as fallback.
+The automatic host warmer (3c) is deferred — v1 is populated manually by running
+`warm-cache.sh` yourself, with `cache.nixos.org` as fallback.
 
 ## One-time setup
 
@@ -150,6 +153,49 @@ The guest-side checks run `curl` *inside* a Lima VM, so point `--vm` at a
 guest fetches `nix-cache-info` via `host.lima.internal` (proving the usernet
 forward) and that a live `/nix/store` path is 404 (curated, not the whole store).
 
+## Warming the cache
+
+`warm-cache.sh <target>...` populates the docroot with signed `aarch64-linux`
+build closures. Run it as the signing user (`ci`, not root) after `init-cache.sh`:
+
+    # realise the target first (off the hot path) — this is the one slow build:
+    nix build .#packages.aarch64-linux.default
+    # then publish its signed closure into the cache:
+    ./warm-cache.sh default          # bare name -> .#packages.aarch64-linux.<name>
+    ./warm-cache.sh default gha-guest-image '.#packages.aarch64-linux.foo'
+
+For each target it:
+
+1. **Forces `aarch64-linux` and asserts it.** The flake is `eachDefaultSystem`,
+   so an unqualified `.#default` on this Mac would resolve to *aarch64-darwin* — a
+   closure useless to Linux guests. A bare name is rewritten to
+   `.#packages.aarch64-linux.<name>`, and the resolved derivation's `system` is
+   asserted to be `aarch64-linux` (a fully-qualified target is honoured verbatim
+   but still asserted) — wrong-platform targets are refused, not warmed.
+2. **Preflights that the target is built**, then **copies the full build
+   closure.** It first checks the target derivation's own output is valid locally
+   — if you haven't `nix build`-ed it, it stops and says so (rather than copy the
+   stray sources a never-built target still exposes and claim success). It then
+   copies `nix-store -qR --include-outputs` of the `.drv` — not just the output
+   runtime closure, which would miss `cargoArtifacts` (the crane Rust deps) and
+   leave guests rebuilding them. `*.drv` paths are filtered out (guests
+   substitute outputs, not build instructions); the list streams into `nix copy
+   --stdin` (no `ARG_MAX`).
+3. **Signs during the copy** with the Mac key (`file://…?secret-key=…`), so each
+   narinfo carries a `gha-mac-cache-1:` signature the guests trust (3b).
+4. **Records a manifest** (`$GHA_CACHE_DIR/manifest/warmed.log`, outside the
+   docroot) of every warmed path — the future prune's keep-set.
+
+It **copies what is already realised; it never builds** (a from-source
+`aarch64-linux` build is slow on the single-vCPU `linux-builder` and would
+contend with live CI). So **`nix build` the target first, then warm right
+after** — from the **same clean checkout** (the derivation hash is tied to the
+tree) and before any `nix-collect-garbage`, since gcroots protect the target's
+runtime closure but *not* build-only deps like `cargoArtifacts`. The whole
+copy/manifest sequence runs under one host-level lock (atomic `mkdir`, since
+macOS has no `flock`) so it can't interleave with the running server or a
+concurrent warm.
+
 ## Layout
 
 Out-of-tree (host state; only the scripts here are version-controlled), under
@@ -158,6 +204,8 @@ Out-of-tree (host state; only the scripts here are version-controlled), under
     keys/                      # NOT served — sibling of, never under, cache/
       gha-mac-cache-1.secret   # 0600 signing private key
       gha-mac-cache-1.public   # the trusted-public-keys string for guests
+    manifest/                  # NOT served — 0700; warmed.log = warm-cache.sh's record
+      warmed.log               # TSV: timestamp <TAB> target <TAB> store_path
     cache/                     # the docroot the server will expose, read-only
       nix-cache-info           # StoreDir / WantMassQuery / Priority: 10
       # nar/ and *.narinfo land here once warm-cache.sh runs
