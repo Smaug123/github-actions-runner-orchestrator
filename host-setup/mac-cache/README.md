@@ -19,15 +19,19 @@ domain"). Segmenting per-repo is deferred (`DEFERRED.md`).
 
 ## Status — built so far
 
-- **slice 1 (this commit): signing keypair + curated cache docroot.**
-  `init-cache.sh` generates the keypair and the served directory skeleton.
+- **slice 1: signing keypair + curated cache docroot.** `init-cache.sh`.
+- **slice 2a (this commit): confined static server + serve-start gate.**
+  `serve-cache.sh` + `common.sh` (shared layout, so the gate checks the same
+  key path the writer created). Locally verified; deployment is slice 2b.
 
 Still to come (separate slices):
 
-- Static HTTP server over the docroot, under launchd, bound Lima-only — with a
-  positive test (guest fetches a signed path) and a negative test (a live
-  `/nix/store` path is **not** fetchable, and a non-Lima address cannot
-  connect).
+- **slice 2b — deploy the server:** create the dedicated `_gha-cache` user,
+  install the launchd plist, determine the guest-reachable `host.lima.internal`
+  bind address + add a `pf` rule, and run the (+)/(−) tests (a guest fetches a
+  signed path; a live `/nix/store` path is **not** fetchable; a non-Lima
+  address cannot connect; a key symlink/hardlink in the docroot returns
+  403/404).
 - `warm-cache.sh <flake-target>`: `nix copy` the full **build closure** (not
   just outputs — outputs-only misses `cargoArtifacts`) into the docroot, force
   `aarch64-linux`, record a manifest, prune behind a host-level lock.
@@ -56,6 +60,41 @@ This is idempotent. It:
 3. Prints the **public key** — bake this into the guest's
    `trusted-public-keys` in the 3b slice.
 
+## Serving the cache
+
+`serve-cache.sh` is the static HTTP server (darkhttpd) over `cache/`. It is the
+single ExecStart for the launchd daemon that slice 2b installs; run it directly
+only for local testing.
+
+It enforces "the signing key is never reachable from the served docroot" in
+layers, strongest first:
+
+1. **Dedicated user (primary).** Run as root, it drops to `GHA_CACHE_USER`
+   (default `_gha-cache`) — a user that cannot read the `0600`-`ci` signing key.
+   macOS perms are per-inode, so a symlink *or* hardlink to the key under the
+   docroot still `EACCES`es; the kernel enforces this for every writer, no audit
+   needed. (The `_gha-cache` user is created by slice 2b.)
+2. **chroot.** darkhttpd chroots into the docroot, so no path (`..`, symlink)
+   can name a file outside the served tree.
+3. **Serve-start inode gate.** Before serving, it walks the docroot, refuses any
+   symlink (any depth) or non-regular/non-directory entry, and refuses to start
+   if any entry shares the key's `(dev, inode)` (a hardlink) — one ground-truth
+   check covering `init-cache.sh`, `warm-cache.sh`, and manual edits alike.
+4. **No autoindex** (`--no-listing`) and **a specific bind address only**, never
+   `0.0.0.0` (slice 2b sets it to the guest-reachable `host.lima.internal`).
+
+Config (env): `GHA_CACHE_BIND_ADDR` (**required**; a canonical specific IPv4 —
+any-address forms like `0`/`0.0`/`0.0.0.0` are rejected), `GHA_CACHE_PORT`
+(default `8080`), `GHA_CACHE_USER` / `GHA_CACHE_GROUP` (default `_gha-cache`),
+`GHA_DARKHTTPD` (darkhttpd path if not on `PATH`), plus the `GHA_CACHE_DIR` /
+`GHA_CACHE_KEY_NAME` shared with `init-cache.sh`. **`GHA_CACHE_DIR` is required
+when running as root** (the launchd plist must pass it) — root's `$HOME` is not
+where `init-cache.sh`, run as `ci`, wrote the cache.
+
+Run modes: **as root** (launchd/production) it chroots and drops to the
+dedicated user; **as non-root** it serves as the invoking user with NO chroot
+and NO privilege drop, printing a loud warning — local testing only.
+
 ## Layout
 
 Out-of-tree (host state; only the scripts here are version-controlled), under
@@ -68,11 +107,13 @@ Out-of-tree (host state; only the scripts here are version-controlled), under
       nix-cache-info           # StoreDir / WantMassQuery / Priority: 10
       # nar/ and *.narinfo land here once warm-cache.sh runs
 
-**Invariant — secrets live outside the docroot.** The signing private key
-(plus, later, netrc / staging dirs / logs) must never sit under `cache/`. The
-server runs as `ci` and can read its own `0600` files, so anything inside the
-docroot is serveable regardless of file mode. The docroot holds only `nar/`,
-`*.narinfo`, and `nix-cache-info`.
+**Invariant — the signing key is never reachable from the docroot.** The
+private key (plus, later, netrc / staging dirs / logs) lives outside `cache/`;
+the docroot holds only `nar/`, `*.narinfo`, and `nix-cache-info`. But "outside
+the tree" is only the first layer — the server enforces the invariant by
+*capability*: it serves as a dedicated user that cannot read the key, chrooted
+into the docroot, behind a serve-start inode gate (see "Serving the cache"). So
+a stray symlink or hardlink to the key cannot leak it regardless of file mode.
 
 **Invariant — Priority beats list order.** Nix prefers a substituter by the
 `Priority:` in its `nix-cache-info` (lower = preferred), *not* by the order it

@@ -9,9 +9,10 @@
 # follow-up slices that build on what this produces.
 #
 # Two invariants are established here and relied on by every later slice:
-#   1. The signing PRIVATE key lives OUTSIDE the served docroot. The server
-#      runs as `ci` and can read its own 0600 files, so anything under the
-#      docroot is serveable regardless of mode — keys must not be there.
+#   1. The signing PRIVATE key lives OUTSIDE the served docroot. The HTTP server
+#      is additionally locked down (slice 2: a dedicated user that can't read
+#      the key, chrooted into the docroot) — but keeping the key out of the
+#      served tree is the first layer, established here.
 #   2. The cache advertises `Priority: 10` in nix-cache-info. Nix prefers a
 #      substituter by this number (lower = preferred), NOT by substituter-list
 #      order; cache.nixos.org advertises 40, so without an explicit lower
@@ -23,34 +24,11 @@
 # sudo, nothing under /etc.
 set -euo pipefail
 
-# Base dir is out-of-tree (like the linux-builder and guest images): the
-# key/cache are host state, only the *scripts* are version-controlled.
-base="${GHA_CACHE_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/gha-mac-cache}"
-
-# The signing key name becomes the prefix of every narinfo signature and must
-# match a trusted-public-keys entry name in the guest (3b). The `-1` suffix
-# leaves room to rotate (publish `-2` alongside, retire `-1`) without a
-# flag-day. Override only if you know why.
-key_name="${GHA_CACHE_KEY_NAME:-gha-mac-cache-1}"
-
-# Constrain the key name to a safe single basename before it lands in any path.
-# It's interpolated into keys/<name>.secret, so a '/' or '..' could escape
-# keys_dir and write the PRIVATE key under the served docroot — defeating
-# invariant 1. A ':' would also break the `name:base64` signature format. Allow
-# only [A-Za-z0-9._-], non-empty, with no '..'.
-case "$key_name" in
-  "" | *[!A-Za-z0-9._-]* | *..*)
-    echo "error: GHA_CACHE_KEY_NAME must be a non-empty name of [A-Za-z0-9._-] with no '..'; got '$key_name'." >&2
-    exit 1
-    ;;
-esac
-
-# Layout: keys/ is a SIBLING of cache/, never under it (invariant 1).
-keys_dir="$base/keys"
-cache_dir="$base/cache"
-secret_key="$keys_dir/$key_name.secret"
-public_key="$keys_dir/$key_name.public"
-cache_info="$cache_dir/nix-cache-info"
+# Shared layout (base, key_name + validation, keys_dir, cache_dir, secret_key,
+# public_key, cache_info). One definition, shared with serve-cache.sh.
+dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./common.sh
+. "$dir/common.sh"
 
 if ! command -v nix-store >/dev/null 2>&1; then
   echo "error: nix-store not found on PATH." >&2
@@ -72,6 +50,11 @@ done
 mkdir -p "$cache_dir"
 mkdir -p "$keys_dir"
 chmod 700 "$keys_dir"
+# The docroot is PUBLIC (served to guests; no secret lives in it — those stay in
+# keys/). Force it world-traversable regardless of umask: the server drops to a
+# dedicated user (_gha-cache) that must reach it, and under a restrictive umask
+# mkdir would leave 0700, making every guest fetch 403.
+chmod 755 "$cache_dir"
 
 # Belt-and-braces over the leaf check: now both exist as real dirs, assert the
 # keys dir does not RESOLVE to or inside the served cache dir (catches deeper
