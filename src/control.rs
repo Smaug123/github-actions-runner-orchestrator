@@ -176,6 +176,11 @@ struct JobSummary {
     /// From the body (`workflow_job.name`); `null` if the body is unparseable.
     name: Option<String>,
     labels: Vec<String>,
+    /// From the body (`workflow_job.run_id`), as a string for the same 2^53
+    /// reason as `id`. Lets the UI build the GitHub Actions deep link
+    /// `…/actions/runs/{run_id}/job/{id}`; `null` if the body is unparseable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_id: Option<String>,
     /// Queued only: enqueue time (`envelope.received_at_ms`, or file mtime when
     /// that is 0, as reconciler-minted claims hard-code).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -456,6 +461,7 @@ async fn list_active(
                         .iter()
                         .map(|l| sanitize_for_log(l))
                         .collect(),
+                    run_id: Some(event.workflow_job.run_id.to_string()),
                     enqueued_ms: Some(enqueued_ms),
                     claimed_ms: None,
                     age_secs: age_secs(now_ms, enqueued_ms),
@@ -467,7 +473,7 @@ async fn list_active(
                 // Trusted bucket: read display fields directly, and stamp the
                 // VM's status from the snapshot. Absent from the snapshot ->
                 // None (booting / torn down, or no snapshot yet).
-                let (job_name, labels) = parse_name_labels(&body);
+                let (job_name, labels, run_id) = parse_display_fields(&body);
                 let claimed_ms = mtime_ms.unwrap_or(0);
                 let vm = crate::runner::vm_name(id);
                 let vm_status = vm_snapshot.vms.get(&vm).cloned().flatten();
@@ -476,6 +482,7 @@ async fn list_active(
                     repo: sanitize_for_log(&env.repo),
                     name: job_name,
                     labels,
+                    run_id,
                     enqueued_ms: None,
                     claimed_ms: Some(claimed_ms),
                     age_secs: age_secs(now_ms, claimed_ms),
@@ -506,10 +513,12 @@ async fn already_claimed_or_archived(spool: &Spool, name: &str) -> bool {
             .unwrap_or(false)
 }
 
-/// Best-effort `(name, labels)` from a spool body. Both go through
-/// `sanitize_for_log`: they are author-controlled and the payload is served
-/// off-host (not under HMAC).
-fn parse_name_labels(body: &[u8]) -> (Option<String>, Vec<String>) {
+/// Best-effort `(name, labels, run_id)` from a spool body. name/labels go
+/// through `sanitize_for_log`: they are author-controlled and the payload is
+/// served off-host (not under HMAC). run_id is a GitHub-minted integer rendered
+/// as a string (same 2^53 reason as `JobSummary::id`), so it needs no
+/// sanitizing. All three are `None`/empty when the body doesn't parse.
+fn parse_display_fields(body: &[u8]) -> (Option<String>, Vec<String>, Option<String>) {
     match serde_json::from_slice::<WorkflowJob>(body) {
         Ok(wj) => (
             Some(sanitize_for_log(&wj.workflow_job.name)),
@@ -518,8 +527,9 @@ fn parse_name_labels(body: &[u8]) -> (Option<String>, Vec<String>) {
                 .iter()
                 .map(|l| sanitize_for_log(l))
                 .collect(),
+            Some(wj.workflow_job.run_id.to_string()),
         ),
-        Err(_) => (None, Vec::new()),
+        Err(_) => (None, Vec::new(), None),
     }
 }
 
@@ -564,7 +574,7 @@ async fn list_completed(spool: &Spool, now: SystemTime) -> (Vec<CompletedSummary
         let (repo, name) = match read_spool_file(&path).await {
             Ok((env, body)) => (
                 Some(sanitize_for_log(&env.repo)),
-                parse_name_labels(&body).0,
+                parse_display_fields(&body).0,
             ),
             Err(_) => (None, None),
         };
@@ -963,10 +973,13 @@ mod tests {
         assert_eq!(jobs.queued[0].enqueued_ms, Some(1000));
         assert!(jobs.queued[0].claimed_ms.is_none());
         assert!(jobs.queued[0].vm.is_none());
+        // run_id comes from the body so the UI can deep-link to GitHub Actions.
+        assert_eq!(jobs.queued[0].run_id.as_deref(), Some("2"));
 
         assert_eq!(jobs.in_flight.len(), 1, "one in-flight entry");
         assert_eq!(jobs.in_flight[0].id, "2");
         assert_eq!(jobs.in_flight[0].name.as_deref(), Some("test"));
+        assert_eq!(jobs.in_flight[0].run_id.as_deref(), Some("2"));
         assert!(
             jobs.in_flight[0].claimed_ms.is_some(),
             "claimed_ms = file mtime"

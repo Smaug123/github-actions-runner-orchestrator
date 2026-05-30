@@ -117,6 +117,16 @@ function vmStatusLabel(job) {
   return { text: "booting?", cls: "warn" }; // claimed but absent from the snapshot
 }
 
+// GitHub Actions deep link for a job row, or null when we lack the run_id/repo
+// to build one. repo is "owner/name" (GitHub's restricted charset); we encode
+// each path segment defensively but keep the separating slash. run_id/id are
+// integer strings, harmless, but encoded for the same belt-and-braces reason.
+function ghJobUrl(job) {
+  if (!job.run_id || !job.repo) return null;
+  const repoPath = job.repo.split("/").map(encodeURIComponent).join("/");
+  return `https://github.com/${repoPath}/actions/runs/${encodeURIComponent(job.run_id)}/job/${encodeURIComponent(job.id)}`;
+}
+
 // One renderer for both Queued and In flight — identical columns. In-flight
 // rows also carry a `vm` field, shown as a muted second line under the id (with
 // its live status from the snapshot) so it can be cross-referenced with
@@ -129,7 +139,21 @@ function jobRow(job) {
   const idCell = document.createElement("td");
   const idMain = document.createElement("div");
   idMain.className = "mono";
-  idMain.textContent = job.id;
+  // Link the id to GitHub's Actions UI when we have the run_id; the id text is
+  // still set via textContent (anchor href is a fixed-scheme github.com URL, so
+  // it can't carry script — keeps the never-innerHTML guarantee intact).
+  const url = ghJobUrl(job);
+  if (url) {
+    const a = document.createElement("a");
+    a.className = "job-link";
+    a.href = url;
+    a.textContent = job.id;
+    a.target = "_blank";
+    a.rel = "noopener noreferrer";
+    idMain.appendChild(a);
+  } else {
+    idMain.textContent = job.id;
+  }
   idCell.appendChild(idMain);
   if (job.vm) {
     const vm = document.createElement("div");
