@@ -251,6 +251,15 @@ async fn sweep_inner(config: &Config, gh: &GhClient, lima: &Lima) -> anyhow::Res
     )
     .await?;
 
+    // Prune captured guest serial-console logs past their (separate, longer)
+    // retention window. Best-effort and independent of the archive prune above:
+    // these live under state_dir, not the spool, and key off their own knob.
+    prune_serial_logs(
+        &config.state_dir.join("logs"),
+        config.serial_log_retention_secs,
+    )
+    .await;
+
     // vm_name -> cur/ path for every live claim. The orphan branch consults
     // the key set; the stale-image branch needs the path so it can finalize a
     // reaped VM's claim to error/.
@@ -743,6 +752,84 @@ where
     }
     if removed > 0 {
         info!(dir = %dir.display(), removed, bytes_freed, "gc: pruned old archive entries");
+    }
+}
+
+/// Prune captured guest serial-console logs (`<logs_dir>/<vm>.serial.log`,
+/// written by `runner::write_serial_evidence` when a job's VM shows a kernel
+/// OOM) older than `retention_secs`. `0` disables pruning (keep forever),
+/// mirroring `prune_old_archives`.
+///
+/// Unlike the archive prune this needs NO archive-mutation lock or
+/// recheck-under-lock. That machinery exists because `finalize_*` can
+/// re-archive the same `done/`/`error/` path mid-scan, installing a fresh-mtime
+/// marker a delete-by-stale-stat would then drop. Serial logs cannot hit that
+/// race: their sole writer writes each `<vm>.serial.log` at most once *ever* —
+/// VM names derive from the globally-unique, never-reused GitHub job id — so no
+/// concurrent re-write can race a delete at the same path. A plain age-gated
+/// unlink is correct.
+///
+/// Scoped to the `.serial.log` suffix so anything else parked in `logs/` is left
+/// alone. Best-effort like `prune_archive_dir`: a per-file failure is logged and
+/// skipped, a missing dir treated as empty — never fatal to the sweep.
+async fn prune_serial_logs(logs_dir: &Path, retention_secs: u64) {
+    if retention_secs == 0 {
+        return;
+    }
+    let mut rd = match tokio::fs::read_dir(logs_dir).await {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            warn!(dir = %logs_dir.display(), error = %e, "gc: logs dir unreadable during prune");
+            return;
+        }
+    };
+    let now = std::time::SystemTime::now();
+    let mut removed: u64 = 0;
+    let mut bytes_freed: u64 = 0;
+    loop {
+        let ent = match rd.next_entry().await {
+            Ok(Some(ent)) => ent,
+            Ok(None) => break,
+            Err(e) => {
+                warn!(dir = %logs_dir.display(), error = %e, "gc: read_dir failed mid-prune; stopping dir");
+                break;
+            }
+        };
+        let name = ent.file_name();
+        if !name.to_string_lossy().ends_with(".serial.log") {
+            continue;
+        }
+        // DirEntry::metadata is lstat-like (does not follow symlinks), so a
+        // symlink shows as non-regular here and is skipped — we never unlink
+        // through one. Gate on is_file() before the age check.
+        let md = match ent.metadata().await {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if !md.is_file() {
+            continue;
+        }
+        let age = now
+            .duration_since(md.modified().unwrap_or(now))
+            .unwrap_or_default();
+        if age.as_secs() <= retention_secs {
+            continue;
+        }
+        match tokio::fs::remove_file(ent.path()).await {
+            Ok(()) => {
+                removed += 1;
+                bytes_freed += md.len();
+            }
+            // Raced a concurrent removal; not an error.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                warn!(file = %sanitize_for_log(&name.to_string_lossy()), error = %e, "gc: failed to prune serial log")
+            }
+        }
+    }
+    if removed > 0 {
+        info!(dir = %logs_dir.display(), removed, bytes_freed, "gc: pruned old serial-console logs");
     }
 }
 
@@ -1472,6 +1559,74 @@ mod tests {
 
         prune_old_archives(&done, &error, TWO_DAYS).await.unwrap();
 
+        assert!(subdir.exists(), "non-regular entries must be skipped");
+    }
+
+    // ---- prune_serial_logs (filesystem-backed) ----
+
+    #[tokio::test]
+    async fn prune_serial_logs_removes_old_keeps_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path().join("logs");
+        tokio::fs::create_dir_all(&logs).await.unwrap();
+        let old = logs.join("gha-0000000000000001.serial.log");
+        let fresh = logs.join("gha-0000000000000002.serial.log");
+        for p in [&old, &fresh] {
+            tokio::fs::write(p, b"console").await.unwrap();
+        }
+        backdate(&old, TWO_DAYS + 3600);
+        // `fresh` keeps its ~now mtime; window is 1 day so `old` (2d+) is past it.
+
+        prune_serial_logs(&logs, 24 * 60 * 60).await;
+
+        assert!(!old.exists(), "old serial log should be pruned");
+        assert!(fresh.exists(), "within-window serial log should be kept");
+    }
+
+    #[tokio::test]
+    async fn prune_serial_logs_disabled_when_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path().join("logs");
+        tokio::fs::create_dir_all(&logs).await.unwrap();
+        let ancient = logs.join("gha-0000000000000003.serial.log");
+        tokio::fs::write(&ancient, b"x").await.unwrap();
+        backdate(&ancient, 3650 * 24 * 60 * 60);
+
+        prune_serial_logs(&logs, 0).await;
+
+        assert!(
+            ancient.exists(),
+            "retention_secs == 0 must disable serial-log pruning entirely"
+        );
+    }
+
+    #[tokio::test]
+    async fn prune_serial_logs_tolerates_missing_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        // logs/ is never created; must not panic.
+        prune_serial_logs(&dir.path().join("logs"), TWO_DAYS).await;
+    }
+
+    #[tokio::test]
+    async fn prune_serial_logs_skips_unrelated_and_non_regular() {
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path().join("logs");
+        tokio::fs::create_dir_all(&logs).await.unwrap();
+        // An old file without the .serial.log suffix must be left alone.
+        let unrelated = logs.join("notes.txt");
+        tokio::fs::write(&unrelated, b"keep me").await.unwrap();
+        backdate(&unrelated, TWO_DAYS + 3600);
+        // An old subdir that happens to end in .serial.log must be left alone
+        // (is_file() gates before the age check).
+        let subdir = logs.join("weird.serial.log");
+        tokio::fs::create_dir_all(&subdir).await.unwrap();
+
+        prune_serial_logs(&logs, TWO_DAYS).await;
+
+        assert!(
+            unrelated.exists(),
+            "non-.serial.log entries must be skipped"
+        );
         assert!(subdir.exists(), "non-regular entries must be skipped");
     }
 

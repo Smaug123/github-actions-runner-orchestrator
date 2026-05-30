@@ -112,6 +112,16 @@ pub struct Config {
     #[arg(long, env = "ARCHIVE_RETENTION_SECS", default_value_t = 2 * 24 * 60 * 60)]
     pub archive_retention_secs: u64,
 
+    /// Seconds to retain captured guest serial-console logs
+    /// (`state_dir/logs/<vm>.serial.log`, written when a job's VM shows a kernel
+    /// OOM) before the GC sweep prunes them. 0 disables pruning (keeps them
+    /// forever). Default 14 days — kept deliberately longer than
+    /// ARCHIVE_RETENTION_SECS because these are rare, small, forensic captures
+    /// for an open OOM investigation, and a 2-day window could sweep the
+    /// evidence before an operator reviews it.
+    #[arg(long, env = "SERIAL_LOG_RETENTION_SECS", default_value_t = 14 * 24 * 60 * 60)]
+    pub serial_log_retention_secs: u64,
+
     /// Per-request HTTP timeout for GitHub API calls.
     #[arg(long, env = "GH_API_TIMEOUT_SECS", default_value_t = 60)]
     pub api_timeout_secs: u64,
