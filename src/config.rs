@@ -226,6 +226,19 @@ pub struct Config {
     /// `[A-Za-z0-9._-]` with no `..`, since it is interpolated into that path.
     #[arg(long, env = "GHA_CACHE_KEY_NAME", default_value = "gha-mac-cache-1")]
     pub warm_cache_key_name: String,
+
+    /// Maximum number of warm builds running at once. A candidate that arrives
+    /// while the cap is full is dropped, not queued — the warmer must never let
+    /// a burst pile up or delay the jobs that trigger it. Validated >= 1 when
+    /// the warmer is enabled.
+    #[arg(long, env = "WARM_MAX_CONCURRENCY", default_value_t = 1)]
+    pub warm_max_concurrency: usize,
+
+    /// Coalesce window: a (owner, repo, sha) warmed within this many seconds is
+    /// skipped, so the many workflow_job events one push emits collapse to a
+    /// single build. 0 disables coalescing (every qualifying job warms).
+    #[arg(long, env = "WARM_COALESCE_TTL_SECS", default_value_t = 10 * 60)]
+    pub warm_coalesce_ttl_secs: u64,
 }
 
 fn default_runner_labels() -> Vec<String> {
@@ -289,6 +302,11 @@ impl Config {
     fn validate_cache_warm(&mut self) -> Result<()> {
         if !self.cache_warm_enabled {
             return Ok(());
+        }
+        // Zero would make the warmer's semaphore reject every candidate, so the
+        // warmer would silently never run — reject it like MAX_CONCURRENCY.
+        if self.warm_max_concurrency == 0 {
+            anyhow::bail!("WARM_MAX_CONCURRENCY must be >= 1 when CACHE_WARM_ENABLED");
         }
         // Clone the configured paths so the validation below holds no borrow of
         // `self` when we write the canonical NIX_BIN back at the end.

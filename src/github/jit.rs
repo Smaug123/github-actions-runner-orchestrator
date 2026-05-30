@@ -528,7 +528,9 @@ impl GhClient {
 /// `/`, `#`, `?`, `&`, `%` (`release/1.0`, `feat#42`); interpolated raw they
 /// would split the path, open a query string, or otherwise corrupt the request
 /// URL. Encoding everything non-unreserved keeps the value inside one segment.
-fn encode_path_segment(s: &str) -> String {
+/// (Also reused by the cache warmer for the flakeref `?ref=` query value — the
+/// unreserved-only encoding is valid there too.)
+pub(crate) fn encode_path_segment(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for &b in s.as_bytes() {
         match b {

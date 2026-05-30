@@ -21,6 +21,7 @@ mod lima;
 mod runner;
 mod spool;
 mod supervisor;
+mod warm;
 
 #[tokio::main]
 async fn main() -> Result<()> {
