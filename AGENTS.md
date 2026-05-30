@@ -4,6 +4,37 @@ Tokio daemon that drains a [`gh-webhook-spool`](../gh-webhook-spool)
 queue, mints repo-scoped JIT runners via a GitHub App, and runs each
 `workflow_job` in an ephemeral Lima VM. macOS + Apple Silicon only.
 
+## Ethos — keep these goals in mind
+
+Security-first, single-host infrastructure on one Apple Silicon Mac. The
+choices below are deliberate, not incidental scaffolding — preserve them and
+weigh new work against them.
+
+- **Full-VM isolation is the point.** Jobs run untrusted code; a per-job vz VM
+  (separate kernel, ephemeral, single-use) is the trust boundary. Containers
+  share the host kernel — a downgrade. Defence in depth over convenience.
+- **Don't reach for an orchestrator.** One host gives a scheduler nothing to
+  schedule; k8s/ARC would either downgrade isolation (containers) or bolt on a
+  cluster control plane that *widens* the trust surface — the opposite of the
+  goal. **Less standing infrastructure is a feature.** This is not "a
+  half-finished orchestrator," it's a deliberately small appliance. (Considered
+  and rejected for this threat model + scale: ARC, Nomad+Lima, KubeVirt.)
+- **Visibility is a first-class goal, not bloat.** Observability is how you
+  notice when a paranoid system misbehaves, and the tool should be a joy to
+  operate. Read-only views are welcome — build them well.
+- **Where the "are we reinventing an orchestrator?" line sits:**
+  - *Read-only observability* (status, queue, VMs, completed) → build freely;
+    near-zero new authority or state.
+  - *Mutating control* (priority reorder, kill buttons, requeue) → deliberate:
+    each adds authority to a loopback no-auth endpoint and new invariants. Not
+    free; justify it.
+  - *Cross-host / scheduling / autoscaling* → don't. Needing it is the signal
+    to re-evaluate adopting a real tool (and the platform), not to grow this
+    binary.
+- **Single-host, no HA, no near-term scaling are accepted tradeoffs.** If the
+  laptop dies, CI stops — a conscious choice for a personal setup, not a gap to
+  "fix" with clustering.
+
 ## Commands
 
 ```
