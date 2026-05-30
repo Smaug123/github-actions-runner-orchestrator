@@ -565,6 +565,10 @@ fn build_event(full_name: &str, job: &JobStatus) -> WorkflowJob {
             id: job.id,
             run_id: job.run_id,
             run_attempt: job.run_attempt,
+            // The API JobStatus carries no head branch/sha, and a reconciled
+            // job should not drive cache warming anyway, so leave them absent.
+            head_branch: None,
+            head_sha: None,
             name: job.name.clone(),
             labels: job.labels.clone(),
         },
