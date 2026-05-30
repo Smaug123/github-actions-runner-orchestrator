@@ -67,6 +67,17 @@ pub async fn run(rt: Runtime) -> Result<()> {
         // Bind here, not inside the task, so a failure (e.g. port in use) fails
         // startup rather than silently leaving no control endpoint.
         let listener = crate::control::bind(addr).await?;
+        // VM-snapshot poller: publishes the daemon's own view of its managed
+        // Lima VMs so the control UI reads a cached snapshot instead of spawning
+        // limactl per request. Only runs while the control server is enabled.
+        let (vm_tx, vm_rx) =
+            tokio::sync::watch::channel(Arc::new(crate::control::VmSnapshot::default()));
+        {
+            let lima = Arc::clone(&lima);
+            tokio::spawn(async move {
+                crate::control::poll_vm_snapshots(lima, vm_tx).await;
+            });
+        }
         let state = crate::control::ControlState {
             pause: pause_tx.clone(),
             permits: Arc::clone(&permits),
@@ -76,6 +87,7 @@ pub async fn run(rt: Runtime) -> Result<()> {
             allowed_repos: Arc::clone(&allowed_repos),
             runner_labels: Arc::clone(&runner_labels),
             runner_label: config.runner_label.clone(),
+            vms: vm_rx,
         };
         tokio::spawn(async move {
             if let Err(e) = crate::control::serve(listener, state).await {

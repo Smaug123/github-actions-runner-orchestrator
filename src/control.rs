@@ -11,7 +11,7 @@
 // change, and it can't exfiltrate anything sensitive. The UI is just a client
 // for that same API, so it widens no capability.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -31,7 +31,9 @@ use tokio::sync::{watch, Semaphore};
 use tracing::warn;
 use zeroize::Zeroizing;
 
+use crate::gc::is_managed_vm_name;
 use crate::github::event::WorkflowJob;
+use crate::lima::Lima;
 use crate::spool::{parse_spool_filename, read_spool_file, sanitize_for_log, Spool};
 use crate::supervisor::{classify_validated_entry, EntryVerdict};
 
@@ -58,6 +60,65 @@ pub struct ControlState {
     pub allowed_repos: Arc<HashSet<String>>,
     pub runner_labels: Arc<HashSet<String>>,
     pub runner_label: String,
+    /// Latest snapshot of managed Lima VMs, published by the daemon's own poller
+    /// (`poll_vm_snapshots`). Reading it is lock-free and instant — the UI sees
+    /// what the service *believes* is running, not a fresh per-request query.
+    pub vms: watch::Receiver<Arc<VmSnapshot>>,
+}
+
+/// A point-in-time view of managed (`gha-<16hex>`) Lima VMs the daemon polled.
+#[derive(Debug, Clone, Default)]
+pub struct VmSnapshot {
+    /// Wall-clock ms when taken; `0` = never polled yet (poller hasn't run, or
+    /// `limactl list` has not yet succeeded).
+    pub taken_ms: u128,
+    /// Managed VM name -> Lima status (`Running`/`Stopped`/…); `None` if limactl
+    /// omitted a status for the row.
+    pub vms: HashMap<String, Option<String>>,
+}
+
+/// How often the VM-snapshot poller refreshes (only while the control server is
+/// enabled). Matches the UI's `/jobs` cadence so a shown VM status is at most
+/// about one cycle stale.
+const VM_SNAPSHOT_POLL: Duration = Duration::from_secs(5);
+
+/// Publish the daemon's view of its managed Lima VMs on an interval, so the
+/// control UI reads a cached snapshot instead of spawning `limactl` per request.
+///
+/// On a failed/timed-out `limactl list` we keep the last good snapshot rather
+/// than blanking it: its `taken_ms` simply stops advancing, which the UI
+/// surfaces as growing staleness — more honest than flapping every VM to
+/// "unknown" on a single transient error. Exits when the control server (the
+/// only receiver) is gone.
+pub async fn poll_vm_snapshots(lima: Arc<Lima>, tx: watch::Sender<Arc<VmSnapshot>>) {
+    let mut tick = tokio::time::interval(VM_SNAPSHOT_POLL);
+    // First tick fires immediately, so the snapshot populates promptly.
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tick.tick().await;
+        if tx.is_closed() {
+            break;
+        }
+        match lima.list_instances_detailed().await {
+            Ok(instances) => {
+                let vms = instances
+                    .into_iter()
+                    .filter(|i| is_managed_vm_name(&i.name))
+                    .map(|i| (i.name, i.status))
+                    .collect();
+                let snap = VmSnapshot {
+                    taken_ms: ms_since_epoch(SystemTime::now()),
+                    vms,
+                };
+                if tx.send(Arc::new(snap)).is_err() {
+                    break;
+                }
+            }
+            Err(e) => {
+                warn!(error = %format!("{e:#}"), "control: limactl list for VM snapshot failed; keeping last");
+            }
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -126,6 +187,11 @@ struct JobSummary {
     /// In-flight only: the Lima VM name, to correlate with `limactl list`.
     #[serde(skip_serializing_if = "Option::is_none")]
     vm: Option<String>,
+    /// In-flight only: the VM's status from the latest snapshot ("Running"/…),
+    /// or `null` when the VM isn't in the snapshot (booting / torn down) or no
+    /// snapshot exists yet. The UI reads `vm_snapshot_ms` to tell those apart.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vm_status: Option<String>,
 }
 
 /// One finished job from done/ or error/, within the completed window.
@@ -160,6 +226,13 @@ struct JobsResponse {
     queued_truncated: bool,
     in_flight_truncated: bool,
     completed_truncated: bool,
+    /// When the VM snapshot driving `vm_status` was taken (epoch ms); `null` if
+    /// the poller hasn't produced one yet. The UI shows its age as staleness.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vm_snapshot_ms: Option<u128>,
+    /// Managed VMs Lima knows about that have no live cur/ claim — i.e. orphans
+    /// GC will reap. Derived from the snapshot; empty in the steady state.
+    orphan_vms: Vec<String>,
 }
 
 /// Which active bucket a listing pass is reading — selects the timestamp source
@@ -192,28 +265,20 @@ impl ControlState {
     /// across a move is benign and self-corrects on the next poll.
     async fn jobs(&self) -> JobsResponse {
         let now = SystemTime::now();
-        let secret: &[u8] = &self.webhook_secret;
-        let (queued, queued_truncated) = list_active(
-            self.spool.as_ref(),
-            Bucket::Queued,
-            now,
-            secret,
-            &self.allowed_repos,
-            &self.runner_label,
-            &self.runner_labels,
-        )
-        .await;
-        let (in_flight, in_flight_truncated) = list_active(
-            self.spool.as_ref(),
-            Bucket::InFlight,
-            now,
-            secret,
-            &self.allowed_repos,
-            &self.runner_label,
-            &self.runner_labels,
-        )
-        .await;
+        // Cheap, lock-free read of the daemon's latest VM view.
+        let snapshot = self.vms.borrow().clone();
+        let (queued, queued_truncated) = list_active(self, Bucket::Queued, now, &snapshot).await;
+        let (in_flight, in_flight_truncated) =
+            list_active(self, Bucket::InFlight, now, &snapshot).await;
         let (completed, completed_truncated) = list_completed(self.spool.as_ref(), now).await;
+
+        // Orphans: managed VMs Lima knows about with no live cur/ claim. The
+        // in-flight rows already carry their derived vm name; any snapshot VM
+        // not among them is unbacked (GC will reap it).
+        let claimed: HashSet<&str> = in_flight.iter().filter_map(|j| j.vm.as_deref()).collect();
+        let orphan_vms = orphan_vm_names(&snapshot, &claimed);
+        let vm_snapshot_ms = (snapshot.taken_ms != 0).then_some(snapshot.taken_ms);
+
         JobsResponse {
             queued,
             in_flight,
@@ -222,6 +287,8 @@ impl ControlState {
             queued_truncated,
             in_flight_truncated,
             completed_truncated,
+            vm_snapshot_ms,
+            orphan_vms,
         }
     }
 }
@@ -271,16 +338,22 @@ async fn app_js() -> impl IntoResponse {
 ///     authenticated body — so the UI never shows a job we'd reject or drop.
 ///   * **In flight (cur/)** already crossed `prepare()` (or was minted by the
 ///     reconciler with a self-computed HMAC), so it is trusted: we read display
-///     fields directly without re-validating.
+///     fields directly without re-validating, and stamp each row's VM status
+///     from `vm_snapshot`.
+///
+/// Takes `&ControlState` (rather than a long parameter list) for the spool +
+/// validation context; `vm_snapshot` is only consulted for the InFlight pass.
 async fn list_active(
-    spool: &Spool,
+    state: &ControlState,
     bucket: Bucket,
     now: SystemTime,
-    secret: &[u8],
-    allowed_repos: &HashSet<String>,
-    runner_label: &str,
-    runner_labels: &HashSet<String>,
+    vm_snapshot: &VmSnapshot,
 ) -> (Vec<JobSummary>, bool) {
+    let spool = state.spool.as_ref();
+    let secret: &[u8] = &state.webhook_secret;
+    let allowed_repos = state.allowed_repos.as_ref();
+    let runner_label = state.runner_label.as_str();
+    let runner_labels = state.runner_labels.as_ref();
     let now_ms = ms_since_epoch(now);
     let dir = match bucket {
         Bucket::Queued => spool.new_dir(),
@@ -387,12 +460,17 @@ async fn list_active(
                     claimed_ms: None,
                     age_secs: age_secs(now_ms, enqueued_ms),
                     vm: None,
+                    vm_status: None,
                 }
             }
             Bucket::InFlight => {
-                // Trusted bucket: read display fields directly.
+                // Trusted bucket: read display fields directly, and stamp the
+                // VM's status from the snapshot. Absent from the snapshot ->
+                // None (booting / torn down, or no snapshot yet).
                 let (job_name, labels) = parse_name_labels(&body);
                 let claimed_ms = mtime_ms.unwrap_or(0);
+                let vm = crate::runner::vm_name(id);
+                let vm_status = vm_snapshot.vms.get(&vm).cloned().flatten();
                 JobSummary {
                     id: id.to_string(),
                     repo: sanitize_for_log(&env.repo),
@@ -401,7 +479,8 @@ async fn list_active(
                     enqueued_ms: None,
                     claimed_ms: Some(claimed_ms),
                     age_secs: age_secs(now_ms, claimed_ms),
-                    vm: Some(crate::runner::vm_name(id)),
+                    vm: Some(vm),
+                    vm_status,
                 }
             }
         };
@@ -607,6 +686,20 @@ fn age_secs(now_ms: u128, then_ms: u128) -> u64 {
     u64::try_from(now_ms.saturating_sub(then_ms) / 1000).unwrap_or(u64::MAX)
 }
 
+/// Managed VM names present in the snapshot but absent from `claimed` (the set
+/// of vm names backed by a live cur/ entry) — orphans GC will reap. Sorted for
+/// stable output.
+fn orphan_vm_names(snapshot: &VmSnapshot, claimed: &HashSet<&str>) -> Vec<String> {
+    let mut orphans: Vec<String> = snapshot
+        .vms
+        .keys()
+        .filter(|name| !claimed.contains(name.as_str()))
+        .cloned()
+        .collect();
+    orphans.sort();
+    orphans
+}
+
 /// True iff this error chain bottoms out in a `NotFound` — the benign case
 /// where an entry moved (new→cur→done) between our `read_dir` and our open.
 fn is_vanished(e: &anyhow::Error) -> bool {
@@ -667,6 +760,10 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
+        // Seed an empty VM snapshot; tests that exercise vm_status replace it
+        // via `with_vm_snapshot`. The sender is dropped — a watch receiver still
+        // reads the initial value after the sender is gone.
+        let (_vm_tx, vm_rx) = watch::channel(Arc::new(VmSnapshot::default()));
         let state = ControlState {
             pause,
             permits: Arc::new(Semaphore::new(max)),
@@ -676,8 +773,20 @@ mod tests {
             allowed_repos: Arc::new(["o/r".to_string()].into_iter().collect()),
             runner_labels: Arc::new(labels),
             runner_label: GATE_LABEL.to_string(),
+            vms: vm_rx,
         };
         (state, rx, dir)
+    }
+
+    /// Override a state's VM snapshot for tests. `vms` is `(name, status)`;
+    /// `taken_ms` of 0 means "never polled".
+    fn with_vm_snapshot(s: &mut ControlState, taken_ms: u128, vms: &[(&str, Option<&str>)]) {
+        let map = vms
+            .iter()
+            .map(|(n, st)| (n.to_string(), st.map(str::to_string)))
+            .collect();
+        let (_tx, rx) = watch::channel(Arc::new(VmSnapshot { taken_ms, vms: map }));
+        s.vms = rx;
     }
 
     /// HMAC-SHA256 a body into the `sha256=<hex>` form `verify_signature` wants.
@@ -1075,6 +1184,60 @@ mod tests {
         assert!(capped, "should report hitting the scan cap");
         assert_eq!(found.len(), 1, "only one entry examined before the cap");
         assert_eq!(scanned, COMPLETED_SCAN_CAP);
+    }
+
+    // In-flight rows are stamped with the VM's status from the snapshot, and
+    // snapshot VMs with no live claim are reported as orphans.
+    #[tokio::test]
+    async fn jobs_inflight_vm_status_and_orphans() {
+        let (mut s, _rx, dir) = state(4);
+        seed_signed(dir.path(), "cur", 2, "test", &[GATE_LABEL], 0).await;
+        let claimed_vm = crate::runner::vm_name(2);
+        let orphan_vm = crate::runner::vm_name(999);
+        with_vm_snapshot(
+            &mut s,
+            1_700_000_000_000,
+            &[
+                (claimed_vm.as_str(), Some("Running")),
+                (orphan_vm.as_str(), Some("Running")),
+            ],
+        );
+
+        let jobs = s.jobs().await;
+        assert_eq!(jobs.in_flight.len(), 1);
+        assert_eq!(jobs.in_flight[0].vm.as_deref(), Some(claimed_vm.as_str()));
+        assert_eq!(jobs.in_flight[0].vm_status.as_deref(), Some("Running"));
+        assert_eq!(jobs.orphan_vms, vec![orphan_vm]);
+        assert_eq!(jobs.vm_snapshot_ms, Some(1_700_000_000_000));
+    }
+
+    // No snapshot entry for a claimed VM (just booted / torn down) -> vm_status
+    // is null, and an empty snapshot yields no orphans.
+    #[tokio::test]
+    async fn jobs_inflight_vm_status_none_when_absent() {
+        let (mut s, _rx, dir) = state(4);
+        seed_signed(dir.path(), "cur", 3, "test", &[GATE_LABEL], 0).await;
+        with_vm_snapshot(&mut s, 1_700_000_000_000, &[]);
+
+        let jobs = s.jobs().await;
+        assert_eq!(jobs.in_flight.len(), 1);
+        assert!(jobs.in_flight[0].vm_status.is_none());
+        assert!(jobs.orphan_vms.is_empty());
+    }
+
+    #[test]
+    fn orphan_vm_names_excludes_claimed() {
+        let snap = VmSnapshot {
+            taken_ms: 1,
+            vms: [
+                ("gha-a".to_string(), Some("Running".to_string())),
+                ("gha-b".to_string(), None),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let claimed: HashSet<&str> = ["gha-a"].into_iter().collect();
+        assert_eq!(orphan_vm_names(&snap, &claimed), vec!["gha-b".to_string()]);
     }
 
     // Smoke-test the route wiring end to end over HTTP.

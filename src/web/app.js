@@ -79,6 +79,10 @@ el("resume").addEventListener("click", () => send("/resume"));
 
 // ---- tabs: /jobs -----------------------------------------------------------
 
+// epoch ms of the latest VM snapshot (null = none yet); set in renderJobs and
+// read by the in-flight row renderer to label VM status.
+let vmSnapshotMs = null;
+
 function td(text, cls) {
   const cell = document.createElement("td");
   cell.textContent = text;
@@ -103,10 +107,21 @@ function fmtTime(ms) {
   return new Date(ms).toLocaleString();
 }
 
+// Label an in-flight job's VM status for the sub-line. Uses snapshot freshness
+// to tell "claimed but not in Lima yet" (booting/torn down) from "no snapshot".
+function vmStatusLabel(job) {
+  if (job.vm_status) {
+    return { text: job.vm_status, cls: /^running$/i.test(job.vm_status) ? "ok" : "warn" };
+  }
+  if (vmSnapshotMs == null) return null; // no snapshot to speak from
+  return { text: "booting?", cls: "warn" }; // claimed but absent from the snapshot
+}
+
 // One renderer for both Queued and In flight — identical columns. In-flight
-// rows also carry a `vm` field, shown as a muted second line under the id so
-// it can be cross-referenced with `limactl list`. The trailing empty actions
-// cell + stable data-id leave room for future priority-reorder controls.
+// rows also carry a `vm` field, shown as a muted second line under the id (with
+// its live status from the snapshot) so it can be cross-referenced with
+// `limactl list`. The trailing empty actions cell + stable data-id leave room
+// for future priority-reorder controls.
 function jobRow(job) {
   const tr = document.createElement("tr");
   tr.dataset.id = job.id;
@@ -120,6 +135,13 @@ function jobRow(job) {
     const vm = document.createElement("div");
     vm.className = "mono muted sub-line";
     vm.textContent = job.vm;
+    const st = vmStatusLabel(job);
+    if (st) {
+      const badge = document.createElement("span");
+      badge.className = "vm-status " + st.cls;
+      badge.textContent = " · " + st.text;
+      vm.appendChild(badge);
+    }
     idCell.appendChild(vm);
   }
   tr.appendChild(idCell);
@@ -165,6 +187,9 @@ function setNote(id, shown, text) {
 }
 
 function renderJobs(data) {
+  // Set before rendering rows: jobRow reads vmSnapshotMs to label VM status.
+  vmSnapshotMs = data.vm_snapshot_ms ?? null;
+
   fillRows("queued-rows", "queued-empty", data.queued, jobRow);
   fillRows("inflight-rows", "inflight-empty", data.in_flight, jobRow);
   fillRows("completed-rows", "completed-empty", data.completed, completedRow);
@@ -185,6 +210,29 @@ function renderJobs(data) {
     data.completed_truncated,
     `Showing newest ${(data.completed || []).length} of the last ${data.completed_window_hours}h; older entries omitted.`
   );
+
+  renderVmNote(data);
+}
+
+// VM snapshot freshness + orphan VMs, shown on the In flight tab. Always
+// visible there: muted for the normal "as of Ns ago", amber when orphans exist.
+function renderVmNote(data) {
+  const note = el("vm-note");
+  const orphans = data.orphan_vms || [];
+  let alert = false;
+  if (vmSnapshotMs == null) {
+    note.textContent = "VM status: initializing…";
+  } else {
+    const age = Math.max(0, Math.floor((Date.now() - vmSnapshotMs) / 1000));
+    let msg = `VM snapshot ${fmtAge(age)} ago`;
+    if (orphans.length) {
+      msg += ` · ${orphans.length} orphan VM(s) (GC will reap): ${orphans.join(", ")}`;
+      alert = true;
+    }
+    note.textContent = msg;
+  }
+  note.className = alert ? "note" : "subtle";
+  note.hidden = false;
 }
 
 async function refreshJobs() {

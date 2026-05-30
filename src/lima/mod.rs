@@ -168,6 +168,18 @@ impl Lima {
     /// Lima, or a partially-realized instance) yields `None` so the caller can
     /// fail safe and skip it rather than misclassify.
     pub async fn list_instances(&self) -> Result<Vec<(String, Option<PathBuf>)>> {
+        Ok(self
+            .list_instances_detailed()
+            .await?
+            .into_iter()
+            .map(|i| (i.name, i.dir))
+            .collect())
+    }
+
+    /// Like `list_instances` but also carries each instance's `status`
+    /// (`Running`/`Stopped`/…). Used by the control endpoint's VM-snapshot
+    /// poller to show the daemon's live view of its managed VMs.
+    pub async fn list_instances_detailed(&self) -> Result<Vec<LimaInstance>> {
         let mut cmd = Command::new(&self.bin);
         // Capture stderr rather than letting it inherit: with no instances,
         // `limactl list` prints "No instance found ..." to stderr on every
@@ -189,24 +201,41 @@ impl Lima {
                 String::from_utf8_lossy(&out.stderr).trim()
             );
         }
-        // `limactl list --json` emits one JSON object per line.
-        let mut instances = Vec::new();
-        for line in out.stdout.split(|&b| b == b'\n') {
-            if line.is_empty() {
-                continue;
-            }
-            let v: serde_json::Value = match serde_json::from_slice(line) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            if let Some(n) = v.get("name").and_then(|n| n.as_str()) {
-                // `dir` is the lowercase JSON key for the Go `.Dir` field.
-                let dir = v.get("dir").and_then(|d| d.as_str()).map(PathBuf::from);
-                instances.push((n.to_string(), dir));
-            }
-        }
-        Ok(instances)
+        Ok(parse_list_json(&out.stdout))
     }
+}
+
+/// One row of `limactl list --json`. We only read the fields we use; the JSON
+/// keys are the lowercase Go field names (`name`, `dir`, `status`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LimaInstance {
+    pub name: String,
+    pub dir: Option<PathBuf>,
+    pub status: Option<String>,
+}
+
+/// Parse `limactl list --json` output: one JSON object per line. Rows without a
+/// `name`, and lines that don't parse, are skipped. Pure (no I/O) so it's unit
+/// tested directly; both list methods funnel through it.
+fn parse_list_json(stdout: &[u8]) -> Vec<LimaInstance> {
+    let mut instances = Vec::new();
+    for line in stdout.split(|&b| b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let v: serde_json::Value = match serde_json::from_slice(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if let Some(name) = v.get("name").and_then(|n| n.as_str()) {
+            instances.push(LimaInstance {
+                name: name.to_string(),
+                dir: v.get("dir").and_then(|d| d.as_str()).map(PathBuf::from),
+                status: v.get("status").and_then(|s| s.as_str()).map(str::to_string),
+            });
+        }
+    }
+    instances
 }
 
 async fn run_with_timeout(
@@ -222,5 +251,49 @@ async fn run_with_timeout(
             let _ = child.kill().await;
             anyhow::bail!("{what} timed out after {:?}", deadline)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_list_json_extracts_name_dir_status() {
+        // One object per line, as `limactl list --json` emits. Includes a row
+        // with no dir, a line without a name (skipped), and a malformed line
+        // (skipped).
+        let out = concat!(
+            r#"{"name":"gha-0000000000000001","status":"Running","dir":"/Users/ci/.lima/gha-0000000000000001"}"#,
+            "\n",
+            r#"{"name":"gha-000000000000002a","status":"Stopped"}"#,
+            "\n",
+            r#"{"status":"Running","dir":"/x"}"#,
+            "\n",
+            "not json at all",
+            "\n",
+        );
+        let got = parse_list_json(out.as_bytes());
+        assert_eq!(
+            got,
+            vec![
+                LimaInstance {
+                    name: "gha-0000000000000001".into(),
+                    dir: Some(PathBuf::from("/Users/ci/.lima/gha-0000000000000001")),
+                    status: Some("Running".into()),
+                },
+                LimaInstance {
+                    name: "gha-000000000000002a".into(),
+                    dir: None,
+                    status: Some("Stopped".into()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_list_json_empty_is_empty() {
+        assert!(parse_list_json(b"").is_empty());
+        assert!(parse_list_json(b"\n\n").is_empty());
     }
 }

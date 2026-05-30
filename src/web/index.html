@@ -76,6 +76,9 @@
     .reason { color: var(--muted); max-width: 40ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .empty { color: var(--muted); font-size: 13px; padding: 16px 12px; }
     .note { color: var(--amber); font-size: 12px; padding: 8px 12px 0; }
+    .subtle { color: var(--muted); font-size: 12px; padding: 8px 12px 0; }
+    .vm-status.ok { color: var(--green); }
+    .vm-status.warn { color: var(--amber); }
 
     .foot {
       display: flex; justify-content: space-between; gap: 16px;
@@ -119,6 +122,7 @@
     </section>
 
     <section id="tab-inflight" class="panel">
+      <p id="vm-note" class="subtle" hidden></p>
       <p id="inflight-note" class="note" hidden></p>
       <table>
         <thead><tr><th>Job ID</th><th>Repo</th><th>Name</th><th>Labels</th><th>Running for</th><th></th></tr></thead>

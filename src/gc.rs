@@ -108,7 +108,7 @@ const STARTUP_DELETE_BACKOFF: std::time::Duration = std::time::Duration::from_se
 /// the same org/host can plausibly use the same prefix, and GC's runner
 /// branch deletes idle online runners, so a loose match risks blasting away
 /// unrelated infrastructure.
-fn is_managed_vm_name(name: &str) -> bool {
+pub(crate) fn is_managed_vm_name(name: &str) -> bool {
     let Some(suffix) = name.strip_prefix(VM_NAME_PREFIX) else {
         return false;
     };
