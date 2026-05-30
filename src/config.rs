@@ -176,6 +176,56 @@ pub struct Config {
         action = clap::ArgAction::Set
     )]
     pub job_completion_check: bool,
+
+    /// Master switch for the automatic signing-cache warmer (Phase 3c). Off by
+    /// default: it needs the signing-cache server and the linux-builder
+    /// deployed. When on, the four trusted paths below (NIX_BIN,
+    /// WARM_CACHE_BASE, MAC_CACHE_DIR, WARM_TOOLS_DIR) are required and
+    /// validated as trusted exec/source targets at startup.
+    #[arg(
+        long,
+        env = "CACHE_WARM_ENABLED",
+        default_value_t = false,
+        action = clap::ArgAction::Set
+    )]
+    pub cache_warm_enabled: bool,
+
+    /// Absolute path to the `nix` binary the warmer drives for its host-side
+    /// build. Required (and validated) only when CACHE_WARM_ENABLED. Must live
+    /// under `/nix/store`: that tree is content-addressed and immutable, so the
+    /// warmer can pin its child PATH to this binary's directory and trust the
+    /// `nix-store` sibling resolved there (a symlink to `nix`) without a
+    /// separate, symlink-tripping O_NOFOLLOW check.
+    #[arg(long, env = "NIX_BIN")]
+    pub nix_bin: Option<PathBuf>,
+
+    /// The signing-cache base directory (init-cache.sh's `GHA_CACHE_DIR`):
+    /// holds `keys/` (the signing key + `<name>.public`) and the served
+    /// `cache/` docroot. Required when CACHE_WARM_ENABLED; the warmer passes it
+    /// to the scripts as `GHA_CACHE_DIR` so its scrubbed `HOME` can't relocate
+    /// the cache they read and write.
+    #[arg(long, env = "WARM_CACHE_BASE")]
+    pub warm_cache_base: Option<PathBuf>,
+
+    /// The checkout's `host-setup/mac-cache/` directory, holding the warmer's
+    /// two script entrypoints (`warm-cache.sh`, `warm-flake-inputs.sh`) and the
+    /// sourced `common.sh`. Required when CACHE_WARM_ENABLED; each is validated
+    /// as a trusted exec/source target.
+    #[arg(long, env = "MAC_CACHE_DIR")]
+    pub mac_cache_dir: Option<PathBuf>,
+
+    /// Directory holding `jq` (which `warm-flake-inputs.sh` resolves by name).
+    /// Required when CACHE_WARM_ENABLED. The warmer pins its child PATH to only
+    /// trusted dirs, this among them, so a name lookup can't reach a foreign
+    /// binary.
+    #[arg(long, env = "WARM_TOOLS_DIR")]
+    pub warm_tools_dir: Option<PathBuf>,
+
+    /// Signing-key name (common.sh's `GHA_CACHE_KEY_NAME`); the warmer reads the
+    /// public half from `<WARM_CACHE_BASE>/keys/<name>.public`. Constrained to
+    /// `[A-Za-z0-9._-]` with no `..`, since it is interpolated into that path.
+    #[arg(long, env = "GHA_CACHE_KEY_NAME", default_value = "gha-mac-cache-1")]
+    pub warm_cache_key_name: String,
 }
 
 fn default_runner_labels() -> Vec<String> {
@@ -223,6 +273,112 @@ impl Config {
         // execution as the daemon user, so reject both at startup.
         verify_trusted_executable(&self.limactl_path)
             .with_context(|| format!("LIMACTL_PATH {}", self.limactl_path.display()))?;
+        // When the cache warmer is on, validate every host path it will exec,
+        // source, or read up front — the same fail-fast posture limactl gets.
+        self.validate_cache_warm()?;
+        Ok(())
+    }
+
+    /// Validate the cache warmer's trusted inputs at startup (no-op when the
+    /// warmer is off). The warmer's trust rule is that every binary it execs,
+    /// every script it runs, and every file it sources is a *trusted path*, and
+    /// the directories holding them are *trusted directories* — so a validated
+    /// inode can't be swapped, nor a name-lookup redirected, before the warmer
+    /// uses it. We surface any violation here rather than as a confusing
+    /// mid-warm failure.
+    fn validate_cache_warm(&mut self) -> Result<()> {
+        if !self.cache_warm_enabled {
+            return Ok(());
+        }
+        // Clone the configured paths so the validation below holds no borrow of
+        // `self` when we write the canonical NIX_BIN back at the end.
+        let nix_bin = self
+            .nix_bin
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("NIX_BIN is required when CACHE_WARM_ENABLED"))?;
+        let cache_base = self.warm_cache_base.clone().ok_or_else(|| {
+            anyhow::anyhow!("WARM_CACHE_BASE is required when CACHE_WARM_ENABLED")
+        })?;
+        let mac_cache_dir = self
+            .mac_cache_dir
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("MAC_CACHE_DIR is required when CACHE_WARM_ENABLED"))?;
+        let tools_dir = self
+            .warm_tools_dir
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("WARM_TOOLS_DIR is required when CACHE_WARM_ENABLED"))?;
+
+        // `nix` is exec'd directly, and its directory is pinned onto the
+        // warmer's child PATH so the `nix-store` sibling (a symlink to `nix`)
+        // resolves there too. Requiring it under /nix/store makes that dir
+        // immutable + content-addressed, closing the dir-swap gap the
+        // per-inode mode check alone can't.
+        verify_trusted_executable(&nix_bin)
+            .with_context(|| format!("NIX_BIN {}", nix_bin.display()))?;
+        // The store path is what makes the bin dir immutable, so enforce it on
+        // the *resolved* location: `Path::starts_with` is purely lexical, so a
+        // value like /nix/store/../../home/u/bin/nix lexically begins with
+        // /nix/store yet open() resolves the `..` and execs a mutable path
+        // outside the store. require_canonical_under resolves `..`/symlinks
+        // first, defeating that escape.
+        let nix_real =
+            require_canonical_under(&nix_bin, Path::new("/nix/store")).with_context(|| {
+                format!(
+                    "NIX_BIN {} must resolve to a path under /nix/store (content-addressed, \
+                     immutable); the warmer pins this binary's directory onto its child PATH \
+                     and requires an unswappable store path",
+                    nix_bin.display()
+                )
+            })?;
+        // Pin the *canonical* store path back into config: the warmer derives
+        // `nix-store` and the PATH-pinned bin dir from this, so a NIX_BIN whose
+        // ancestor is a symlink that currently resolves into the store (but
+        // could be repointed after startup) must not survive here. (Same
+        // rewrite `ensure_paths` does for `lima_template`.)
+        self.nix_bin = Some(nix_real);
+
+        // Signing-cache base: a trusted dir. The signing material lives in a
+        // `keys/` subdir that must itself be a trusted dir — otherwise another
+        // local user could swap `<name>.secret`/`<name>.public` after this
+        // check — and both keys must be present + trusted.
+        verify_trusted_dir(&cache_base)
+            .with_context(|| format!("WARM_CACHE_BASE {}", cache_base.display()))?;
+        validate_cache_key_name(&self.warm_cache_key_name)?;
+        let keys_dir = cache_base.join("keys");
+        verify_trusted_dir(&keys_dir)
+            .with_context(|| format!("cache keys dir {}", keys_dir.display()))?;
+        let pubkey = keys_dir.join(format!("{}.public", self.warm_cache_key_name));
+        verify_trusted_file(&pubkey)
+            .with_context(|| format!("cache public key {}", pubkey.display()))?;
+        // The secret is the private cache-signing key: it must be present,
+        // owned by us (the signer runs as us), and owner-only — a group/world-
+        // readable key lets any local user copy it and forge cache signatures.
+        // init-cache.sh creates it 0600/ci-owned and re-applies that each run;
+        // we fail fast here rather than sign with a leaky key.
+        let secret = keys_dir.join(format!("{}.secret", self.warm_cache_key_name));
+        verify_owner_only_file(&secret)
+            .with_context(|| format!("cache signing key {}", secret.display()))?;
+
+        // The checked-in mac-cache scripts: two exec'd entrypoints plus the
+        // sourced common.sh (which ships -rw-r--r-- — no execute bit, hence the
+        // file rather than executable check; a symlinked or group/world-writable
+        // common.sh would still run as the signing user, so it must be trusted).
+        verify_trusted_dir(&mac_cache_dir)
+            .with_context(|| format!("MAC_CACHE_DIR {}", mac_cache_dir.display()))?;
+        for script in ["warm-cache.sh", "warm-flake-inputs.sh"] {
+            let p = mac_cache_dir.join(script);
+            verify_trusted_executable(&p)
+                .with_context(|| format!("warm script {}", p.display()))?;
+        }
+        let common = mac_cache_dir.join("common.sh");
+        verify_trusted_file(&common).with_context(|| format!("common.sh {}", common.display()))?;
+
+        // Tools dir holding jq (resolved by name from the pinned child PATH).
+        verify_trusted_dir(&tools_dir)
+            .with_context(|| format!("WARM_TOOLS_DIR {}", tools_dir.display()))?;
+        let jq = tools_dir.join("jq");
+        verify_trusted_executable(&jq).with_context(|| format!("jq {}", jq.display()))?;
+
         Ok(())
     }
 
@@ -508,7 +664,24 @@ fn require_owned_by_us_or_root(p: &Path, md: &Metadata) -> Result<()> {
 ///   bytes between our check and `exec`.
 /// - **Some execute bit set.** Surfaces "not executable" as a clear startup
 ///   error rather than a confusing failure on first job dispatch.
-fn verify_trusted_executable(p: &Path) -> Result<()> {
+pub(crate) fn verify_trusted_executable(p: &Path) -> Result<()> {
+    verify_trusted_path(p, true)
+}
+
+/// Trusted-*file* counterpart to `verify_trusted_executable`, for a file the
+/// warmer *sources/reads* rather than execs (e.g. `common.sh`, which ships
+/// `-rw-r--r--`). Identical guarantees — absolute, non-symlink, regular file,
+/// owned by us or root, no group/world write — minus the execute-bit
+/// requirement. The trust check still matters: a symlinked or group/world-
+/// writable sourced file would run arbitrary code as the signing user.
+pub(crate) fn verify_trusted_file(p: &Path) -> Result<()> {
+    verify_trusted_path(p, false)
+}
+
+/// Shared core of `verify_trusted_executable` / `verify_trusted_file`. The
+/// `require_exec` flag is the only difference: a sourced/read file needs every
+/// other property but not an execute bit.
+fn verify_trusted_path(p: &Path, require_exec: bool) -> Result<()> {
     if !p.is_absolute() {
         anyhow::bail!(
             "{} must be an absolute path; bare names trigger PATH lookup",
@@ -530,17 +703,122 @@ fn verify_trusted_executable(p: &Path) -> Result<()> {
     let mode = md.permissions().mode();
     if mode & 0o022 != 0 {
         anyhow::bail!(
-            "{} mode {:04o} permits group/world write; an exec target must be \
+            "{} mode {:04o} permits group/world write; a trusted target must be \
              owner-writable only",
             p.display(),
             mode & 0o777
         );
     }
-    if mode & 0o111 == 0 {
+    if require_exec && mode & 0o111 == 0 {
         anyhow::bail!(
             "{} mode {:04o} has no execute bit set",
             p.display(),
             mode & 0o777
+        );
+    }
+    Ok(())
+}
+
+/// Validate a directory that holds the warmer's trusted exec/source targets: an
+/// absolute, real (non-symlink) directory, owned by us or root, with no
+/// group/world write bits. A per-file `O_NOFOLLOW` check fixes a file's final
+/// component, but an attacker-writable parent could swap the inode between our
+/// check and the warmer's later use; requiring the containing directory to be
+/// non-writable by anyone but us/root closes that gap. (Counterpart to
+/// `verify_strict_private_dir`, which is stricter — 0700, owned by us only —
+/// for directories whose lifecycle we own.)
+pub(crate) fn verify_trusted_dir(p: &Path) -> Result<()> {
+    if !p.is_absolute() {
+        anyhow::bail!("{} must be an absolute path", p.display());
+    }
+    let md = std::fs::symlink_metadata(p).with_context(|| format!("stat {}", p.display()))?;
+    if md.file_type().is_symlink() {
+        anyhow::bail!("{} is a symlink; point at the real directory", p.display());
+    }
+    if !md.file_type().is_dir() {
+        anyhow::bail!("{} is not a directory", p.display());
+    }
+    require_owned_by_us_or_root(p, &md)?;
+    let mode = md.permissions().mode();
+    if mode & 0o022 != 0 {
+        anyhow::bail!(
+            "{} mode {:04o} permits group/world write; a trusted directory must not be \
+             writable by group or other",
+            p.display(),
+            mode & 0o777
+        );
+    }
+    Ok(())
+}
+
+/// Validate a private key the warmer's signer reads and no one else may: an
+/// absolute, non-symlink, regular file, owned by *us* (we run the signer), and
+/// mode 0600-or-stricter — no group/world access at all. Stricter than
+/// `verify_trusted_file`, which permits group/other *read* and root ownership
+/// (fine for a public script, not for a signing key). Mirrors the posture
+/// `read_private_file` enforces, without reading the secret into memory.
+pub(crate) fn verify_owner_only_file(p: &Path) -> Result<()> {
+    if !p.is_absolute() {
+        anyhow::bail!(
+            "{} must be an absolute path; bare names trigger PATH lookup",
+            p.display()
+        );
+    }
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(p)
+        .with_context(|| format!("open {}", p.display()))?;
+    let md = f
+        .metadata()
+        .with_context(|| format!("fstat {}", p.display()))?;
+    if !md.file_type().is_file() {
+        anyhow::bail!("{} is not a regular file", p.display());
+    }
+    require_owned_by_us(p, &md)?;
+    let mode = md.permissions().mode();
+    if mode & 0o077 != 0 {
+        anyhow::bail!(
+            "{} mode {:04o} permits group/world access; a signing key must be owner-only (0600)",
+            p.display(),
+            mode & 0o777
+        );
+    }
+    Ok(())
+}
+
+/// Require that `p`, once `..` and symlinks are resolved, lives under `prefix`.
+/// `Path::starts_with` is purely lexical — `<prefix>/../escape` passes it while
+/// resolving elsewhere — so we canonicalize both sides (the prefix too, since
+/// e.g. macOS `/var` is itself a symlink) and compare the real locations.
+/// Returns the canonical path on success.
+fn require_canonical_under(p: &Path, prefix: &Path) -> Result<PathBuf> {
+    let real = std::fs::canonicalize(p).with_context(|| format!("canonicalize {}", p.display()))?;
+    let real_prefix = std::fs::canonicalize(prefix)
+        .with_context(|| format!("canonicalize {}", prefix.display()))?;
+    if !real.starts_with(&real_prefix) {
+        anyhow::bail!(
+            "{} resolves to {}, which is not under {}",
+            p.display(),
+            real.display(),
+            real_prefix.display()
+        );
+    }
+    Ok(real)
+}
+
+/// Mirror common.sh's key-name guard: the name is interpolated into
+/// `<base>/keys/<name>.public`, so a `/` or `..` could escape `keys/`. Allow
+/// only a non-empty `[A-Za-z0-9._-]` basename with no `..`.
+fn validate_cache_key_name(name: &str) -> Result<()> {
+    let ok = !name.is_empty()
+        && !name.contains("..")
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+    if !ok {
+        anyhow::bail!(
+            "GHA_CACHE_KEY_NAME {name:?} must be a non-empty [A-Za-z0-9._-] name with no '..'"
         );
     }
     Ok(())
@@ -827,5 +1105,142 @@ mod tests {
         std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o600)).unwrap();
         stage_trusted_template(&src, &dst).unwrap();
         assert_eq!(std::fs::read(&dst).unwrap(), b"new contents");
+    }
+
+    #[test]
+    fn verify_trusted_file_accepts_non_executable_0644() {
+        // common.sh is sourced, ships -rw-r--r--, and has no execute bit — the
+        // case verify_trusted_executable would reject and this helper accepts.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("common.sh");
+        std::fs::write(&p, b"# shellcheck shell=bash\n").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        verify_trusted_file(&p).expect("0644 file owned by us should pass the file check");
+        // ...but the executable check must still reject it for the missing bit.
+        let err = verify_trusted_executable(&p).unwrap_err().to_string();
+        assert!(err.contains("execute bit"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn verify_trusted_file_rejects_group_world_writable() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("common.sh");
+        std::fs::write(&p, b"x").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o646)).unwrap();
+        let err = verify_trusted_file(&p).unwrap_err().to_string();
+        assert!(err.contains("group/world write"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn verify_trusted_file_rejects_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real");
+        std::fs::write(&target, b"x").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        // O_NOFOLLOW refuses the symlink at the OS layer.
+        let err = verify_trusted_file(&link).unwrap_err().to_string();
+        assert!(!err.is_empty(), "expected open to fail through symlink");
+    }
+
+    #[test]
+    fn verify_trusted_dir_accepts_0755_dir_we_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("d");
+        std::fs::create_dir(&p).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        verify_trusted_dir(&p).expect("0755 dir owned by us should pass");
+    }
+
+    #[test]
+    fn verify_trusted_dir_rejects_group_world_writable() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("d");
+        std::fs::create_dir(&p).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let err = verify_trusted_dir(&p).unwrap_err().to_string();
+        assert!(err.contains("group/world write"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn verify_trusted_dir_rejects_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let err = verify_trusted_dir(&link).unwrap_err().to_string();
+        assert!(err.contains("symlink"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn verify_trusted_dir_rejects_relative_and_file() {
+        let rel = verify_trusted_dir(Path::new("relative/dir"))
+            .unwrap_err()
+            .to_string();
+        assert!(rel.contains("absolute"), "unexpected error: {rel}");
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("afile");
+        std::fs::write(&p, b"x").unwrap();
+        let err = verify_trusted_dir(&p).unwrap_err().to_string();
+        assert!(err.contains("not a directory"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn verify_owner_only_file_rejects_group_or_other_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("key.secret");
+        std::fs::write(&p, b"signing key").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+        verify_owner_only_file(&p).expect("0600 key owned by us should pass");
+        // A group/other-readable signing key is exactly the bug to reject.
+        for mode in [0o640, 0o644, 0o604, 0o444] {
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
+            let err = verify_owner_only_file(&p).unwrap_err().to_string();
+            assert!(
+                err.contains("owner-only"),
+                "mode {mode:04o} should be rejected, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn require_canonical_under_rejects_parentdir_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("store");
+        std::fs::create_dir(&prefix).unwrap();
+        let inside = prefix.join("real");
+        std::fs::write(&inside, b"x").unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::write(&outside, b"x").unwrap();
+
+        // A genuine subpath resolves under the prefix.
+        require_canonical_under(&inside, &prefix).expect("real subpath should pass");
+
+        // `<prefix>/../outside` is *lexically* under the prefix (the bug the
+        // canonicalize guards against) but resolves outside it.
+        let escape = prefix.join("..").join("outside");
+        assert!(
+            escape.starts_with(&prefix),
+            "precondition: escape is lexically under the prefix"
+        );
+        let err = require_canonical_under(&escape, &prefix)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not under"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn validate_cache_key_name_accepts_and_rejects() {
+        validate_cache_key_name("gha-mac-cache-1").unwrap();
+        validate_cache_key_name("k.2_3").unwrap();
+        for bad in ["", "..", "a/b", "a..b", "key:1", "name with space", "k\n"] {
+            assert!(
+                validate_cache_key_name(bad).is_err(),
+                "expected {bad:?} to be rejected"
+            );
+        }
     }
 }
