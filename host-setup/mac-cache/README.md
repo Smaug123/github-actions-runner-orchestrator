@@ -30,6 +30,10 @@ domain"). Segmenting per-repo is deferred (`DEFERRED.md`).
   address.
 - **slice 3 (this commit): warm the cache.** `warm-cache.sh <target>...` copies
   the full signed **build closure** into the docroot (see "Warming the cache").
+- **slice 3 (inputs): warm flake inputs.** `warm-flake-inputs.sh [flake-ref...]`
+  signs a flake's locked **input source trees** into the docroot so the guest's
+  `nix develop` substitutes them instead of fetching from GitHub (see "Warming
+  flake inputs") — fixes the in-VM flake-input 502s.
 - **3b (guest config, in `nix/guest.nix`):** the guest's `nix.settings` appends
   this cache + its public key via `extra-substituters` /
   `extra-trusted-public-keys`, keeping `cache.nixos.org` and its key.
@@ -196,6 +200,46 @@ copy/manifest sequence runs under one host-level lock (atomic `mkdir`, since
 macOS has no `flock`) so it can't interleave with the running server or a
 concurrent warm.
 
+## Warming flake inputs
+
+`warm-flake-inputs.sh [flake-ref...]` solves a *different* flakiness source than
+`warm-cache.sh`: the in-VM `nix develop` / `nix build` fetching a flake's **input
+sources** (`nixpkgs`, `crane`, `rust-overlay`, …) straight from
+`codeload`/`api.github.com` and getting intermittent **502s** ("unpacking
+`github:owner/repo/<rev>?narHash=…` into the Git cache…"), even past Nix's 5
+retries. Flake-input fetching is a separate Nix subsystem from the binary cache,
+so warming build closures never helped it.
+
+It works because a **locked** input's source is a content-addressed
+`/nix/store/<narHash>-source` path, and Nix's flake fetcher is
+`fetchOrSubstituteTree` — it **substitutes the locked tree from the configured
+substituters before touching the origin**. The guest already trusts this cache
+(`nix/guest.nix`), so once the `-source` paths are signed into the docroot the
+guest pulls them over HTTP from `host.lima.internal` and never calls GitHub.
+(Verified: a fresh store, `--offline`, substituter = this docroot, sigs checked
+against the guest's key, resolves the whole flake.)
+
+Run it as the signing user (`ci`), like `warm-cache.sh`:
+
+    ./warm-flake-inputs.sh                 # no arg -> warm THIS repo's inputs
+    ./warm-flake-inputs.sh /path/to/repo   # a checkout dir (canonicalised)
+    ./warm-flake-inputs.sh github:owner/repo
+
+For each flake it `nix flake archive`s the inputs (fetching any missing ones into
+the **host** store first — do this once, here, where retries have a chance),
+extracts the input source paths (the flake's own per-commit source is
+deliberately skipped), then streams them into the same signed
+`nix copy --stdin --to file://…?secret-key=…` pipeline `warm-cache.sh` uses —
+under the **same** host lock (`$base/warm-cache.lock`) so it can't interleave
+with a closure-warm. It records its own manifest (`manifest/inputs-warmed.log`).
+
+Caveats: **locked inputs only** (substitution replaces the *tree fetch*, not the
+ref→rev resolution an unlocked input still pings GitHub for — all our flakes pin
+a `flake.lock`), and **re-warm after a `flake.lock` bump** (warming is keyed by
+the pinned `narHash`). There is **no `aarch64-linux` assertion** here — an input
+`-source` tree is system-agnostic (the exact content the lock pins), so warming
+from this `aarch64-darwin` host is correct.
+
 ## Layout
 
 Out-of-tree (host state; only the scripts here are version-controlled), under
@@ -204,8 +248,9 @@ Out-of-tree (host state; only the scripts here are version-controlled), under
     keys/                      # NOT served — sibling of, never under, cache/
       gha-mac-cache-1.secret   # 0600 signing private key
       gha-mac-cache-1.public   # the trusted-public-keys string for guests
-    manifest/                  # NOT served — 0700; warmed.log = warm-cache.sh's record
-      warmed.log               # TSV: timestamp <TAB> target <TAB> store_path
+    manifest/                  # NOT served — 0700; the warmers' records
+      warmed.log               # warm-cache.sh: TSV timestamp <TAB> target <TAB> store_path
+      inputs-warmed.log        # warm-flake-inputs.sh: TSV timestamp <TAB> flake-ref <TAB> store_path
     cache/                     # the docroot the server will expose, read-only
       nix-cache-info           # StoreDir / WantMassQuery / Priority: 10
       # nar/ and *.narinfo land here once warm-cache.sh runs
