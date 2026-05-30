@@ -71,6 +71,11 @@ pub async fn run(rt: Runtime) -> Result<()> {
             pause: pause_tx.clone(),
             permits: Arc::clone(&permits),
             max_concurrency: config.max_concurrency,
+            spool: Arc::clone(&spool),
+            webhook_secret: Arc::clone(&webhook_secret),
+            allowed_repos: Arc::clone(&allowed_repos),
+            runner_labels: Arc::clone(&runner_labels),
+            runner_label: config.runner_label.clone(),
         };
         tokio::spawn(async move {
             if let Err(e) = crate::control::serve(listener, state).await {
@@ -318,73 +323,99 @@ async fn prepare(
         }
     };
 
-    if let Some(reason) =
-        validate_envelope(&env, &body_bytes, secret, allowed_repos, filename_job_id)
-    {
-        return Prepared::Reject { cur_path, reason };
-    }
-
-    // 4. We want only workflow_job events with action=queued and our label.
-    if env.event != "workflow_job" {
-        return Prepared::Drop {
+    // 4. Validate the read envelope/body and classify. Shared with the control
+    //    endpoint's queued listing so both apply identical checks (no drift):
+    //    only an entry that would actually Run is shown as queued.
+    match classify_validated_entry(
+        filename_job_id,
+        &env,
+        &body_bytes,
+        secret,
+        allowed_repos,
+        &config.runner_label,
+        runner_labels,
+    ) {
+        EntryVerdict::Run(event) => Prepared::Run {
             cur_path,
-            reason: format!("event={}", env.event),
-        };
+            delivery: env.delivery,
+            event,
+        },
+        EntryVerdict::Drop(reason) => Prepared::Drop { cur_path, reason },
+        EntryVerdict::Reject(reason) => Prepared::Reject { cur_path, reason },
     }
-    let event: WorkflowJob = match serde_json::from_slice(&body_bytes) {
+}
+
+/// Verdict for a spool entry that has already been read into `(envelope, body)`
+/// — the post-read half of `prepare()`, factored out so the control endpoint's
+/// queued listing applies the very same checks before displaying a row.
+pub(crate) enum EntryVerdict {
+    /// Authentic, for us, and queued: would be claimed and run.
+    Run(WorkflowJob),
+    /// Authentic but not for us (wrong event/action/labels) — would be archived
+    /// to done/ on dispatch.
+    Drop(String),
+    /// Failed validation (bad HMAC, mismatch, malformed) — would go to error/.
+    Reject(String),
+}
+
+/// Validate a read spool entry exactly as `prepare()` does after the claim+read:
+/// HMAC + schema + filename↔envelope id + repo allowlist (`validate_envelope`),
+/// then the envelope↔body cross-checks, `action == queued`, and the shared label
+/// policy. Pure (no I/O), so the control listing can reuse it on a `new/` entry
+/// without claiming. `filename_job_id` is the id parsed from the filename; the
+/// caller is responsible for the canonical-filename check (it needs the raw
+/// name, which this function doesn't take).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn classify_validated_entry(
+    filename_job_id: u64,
+    env: &Envelope,
+    body_bytes: &[u8],
+    secret: &[u8],
+    allowed_repos: &HashSet<String>,
+    runner_label: &str,
+    runner_labels: &HashSet<String>,
+) -> EntryVerdict {
+    if let Some(reason) = validate_envelope(env, body_bytes, secret, allowed_repos, filename_job_id)
+    {
+        return EntryVerdict::Reject(reason);
+    }
+    if env.event != "workflow_job" {
+        return EntryVerdict::Drop(format!("event={}", env.event));
+    }
+    let event: WorkflowJob = match serde_json::from_slice(body_bytes) {
         Ok(v) => v,
-        Err(e) => {
-            return Prepared::Reject {
-                cur_path,
-                reason: format!("workflow_job decode: {e}"),
-            };
-        }
+        Err(e) => return EntryVerdict::Reject(format!("workflow_job decode: {e}")),
     };
     // Cross-check every signed envelope field against the body it came from.
     // The HMAC already authenticates the body; this is the spool's faithful-
     // copy check — if the envelope and body disagree we don't know which to
     // trust, so we bail.
     if event.repository.id != env.repo_id {
-        return Prepared::Reject {
-            cur_path,
-            reason: format!(
-                "envelope.repo_id={} != body.repository.id={}",
-                env.repo_id, event.repository.id
-            ),
-        };
+        return EntryVerdict::Reject(format!(
+            "envelope.repo_id={} != body.repository.id={}",
+            env.repo_id, event.repository.id
+        ));
     }
     if event.repository.full_name != env.repo {
-        return Prepared::Reject {
-            cur_path,
-            reason: format!(
-                "envelope.repo={} != body.repository.full_name={}",
-                env.repo, event.repository.full_name
-            ),
-        };
+        return EntryVerdict::Reject(format!(
+            "envelope.repo={} != body.repository.full_name={}",
+            env.repo, event.repository.full_name
+        ));
     }
     if event.workflow_job.id != env.workflow_job_id {
-        return Prepared::Reject {
-            cur_path,
-            reason: format!(
-                "envelope.workflow_job_id={} != body.workflow_job.id={}",
-                env.workflow_job_id, event.workflow_job.id
-            ),
-        };
+        return EntryVerdict::Reject(format!(
+            "envelope.workflow_job_id={} != body.workflow_job.id={}",
+            env.workflow_job_id, event.workflow_job.id
+        ));
     }
     if event.action != env.action {
-        return Prepared::Reject {
-            cur_path,
-            reason: format!(
-                "envelope.action={} != body.action={}",
-                env.action, event.action
-            ),
-        };
+        return EntryVerdict::Reject(format!(
+            "envelope.action={} != body.action={}",
+            env.action, event.action
+        ));
     }
     if event.action != "queued" {
-        return Prepared::Drop {
-            cur_path,
-            reason: format!("action={}", event.action),
-        };
+        return EntryVerdict::Drop(format!("action={}", event.action));
     }
     // Shared label policy: the gate label must be present and every requested
     // label must be in the advertised set — the boundary that stops a workflow
@@ -392,18 +423,9 @@ async fn prepare(
     // names we didn't intend to advertise. The reconciler applies the same
     // predicate to API-discovered jobs. A miss is a Drop (some other factory
     // might handle it); promote to Reject in operator policies that care.
-    match classify_job_labels(
-        &event.workflow_job.labels,
-        &config.runner_label,
-        runner_labels,
-    ) {
-        LabelVerdict::Accept => {}
-        LabelVerdict::Reject(reason) => return Prepared::Drop { cur_path, reason },
-    }
-    Prepared::Run {
-        cur_path,
-        delivery: env.delivery,
-        event,
+    match classify_job_labels(&event.workflow_job.labels, runner_label, runner_labels) {
+        LabelVerdict::Accept => EntryVerdict::Run(event),
+        LabelVerdict::Reject(reason) => EntryVerdict::Drop(reason),
     }
 }
 

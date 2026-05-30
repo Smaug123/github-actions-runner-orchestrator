@@ -12,61 +12,135 @@
     }
     * { box-sizing: border-box; }
     body {
-      margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+      margin: 0; min-height: 100vh;
       background: var(--bg); color: var(--fg);
       font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
     }
-    .card {
-      width: min(420px, 92vw); background: var(--card);
-      border: 1px solid var(--border); border-radius: 12px; padding: 28px;
+    .mono { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace; }
+    .muted { color: var(--muted); }
+
+    /* Persistent header: badge + in-flight meter + pause/resume, driven by
+       /status at 2s. */
+    header {
+      display: flex; flex-wrap: wrap; align-items: center; gap: 20px 28px;
+      padding: 16px 24px; background: var(--card); border-bottom: 1px solid var(--border);
     }
-    h1 { margin: 0 0 4px; font-size: 16px; font-weight: 600; }
-    .sub { margin: 0 0 24px; color: var(--muted); font-size: 13px; }
-    .badge {
-      display: inline-flex; align-items: center; gap: 8px;
-      font-size: 20px; font-weight: 600; margin-bottom: 20px;
-    }
-    .dot { width: 12px; height: 12px; border-radius: 50%; background: var(--muted); }
+    .brand { display: flex; flex-direction: column; }
+    .brand h1 { margin: 0; font-size: 16px; font-weight: 600; }
+    .brand .sub { color: var(--muted); font-size: 12px; }
+    .badge { display: inline-flex; align-items: center; gap: 8px; font-size: 16px; font-weight: 600; }
+    .dot { width: 11px; height: 11px; border-radius: 50%; background: var(--muted); }
     .badge.running .dot { background: var(--green); box-shadow: 0 0 8px var(--green); }
     .badge.paused  .dot { background: var(--amber); box-shadow: 0 0 8px var(--amber); }
     .badge.stale   .dot { background: var(--red); }
-    .meter-label { display: flex; justify-content: space-between; font-size: 13px; color: var(--muted); margin-bottom: 6px; }
+    .meter-wrap { min-width: 160px; }
+    .meter-label { display: flex; justify-content: space-between; gap: 12px; font-size: 12px; color: var(--muted); margin-bottom: 5px; }
     .meter-label b { color: var(--fg); font-variant-numeric: tabular-nums; }
     .meter { height: 8px; background: var(--bg); border: 1px solid var(--border); border-radius: 999px; overflow: hidden; }
     .meter > span { display: block; height: 100%; width: 0; background: var(--accent); transition: width .3s ease; }
-    .buttons { display: flex; gap: 12px; margin-top: 24px; }
+    .buttons { display: flex; gap: 10px; margin-left: auto; }
     button {
-      flex: 1; padding: 10px; border-radius: 8px; border: 1px solid var(--border);
-      background: #21262d; color: var(--fg); font-size: 14px; font-weight: 600; cursor: pointer;
+      padding: 8px 16px; border-radius: 8px; border: 1px solid var(--border);
+      background: #21262d; color: var(--fg); font-size: 13px; font-weight: 600; cursor: pointer;
     }
     button:hover:not(:disabled) { border-color: var(--accent); }
     button:disabled { opacity: .4; cursor: default; }
     #pause:not(:disabled)  { color: var(--amber); }
     #resume:not(:disabled) { color: var(--green); }
-    .foot { display: flex; justify-content: space-between; margin-top: 18px; font-size: 12px; color: var(--muted); }
+
+    /* Tabs */
+    nav.tabs { display: flex; gap: 4px; padding: 0 24px; background: var(--card); border-bottom: 1px solid var(--border); }
+    .tab {
+      padding: 12px 16px; color: var(--muted); text-decoration: none; font-size: 14px; font-weight: 600;
+      border-bottom: 2px solid transparent; margin-bottom: -1px;
+    }
+    .tab:hover { color: var(--fg); }
+    .tab.active { color: var(--fg); border-bottom-color: var(--accent); }
+
+    main { padding: 20px 24px 48px; }
+    .panel { display: none; }
+    .panel.active { display: block; }
+
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    thead th {
+      text-align: left; padding: 8px 12px; color: var(--muted); font-weight: 600;
+      border-bottom: 1px solid var(--border); white-space: nowrap;
+    }
+    tbody td { padding: 9px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
+    tbody tr:hover { background: var(--card); }
+    td.actions { width: 1px; }
+    .sub-line { font-size: 11px; margin-top: 2px; }
+    .labels { color: var(--muted); }
+    .outcome-done  { color: var(--green); font-weight: 600; }
+    .outcome-error { color: var(--red); font-weight: 600; }
+    .reason { color: var(--muted); max-width: 40ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .empty { color: var(--muted); font-size: 13px; padding: 16px 12px; }
+    .note { color: var(--amber); font-size: 12px; padding: 8px 12px 0; }
+
+    .foot {
+      display: flex; justify-content: space-between; gap: 16px;
+      padding: 10px 24px; font-size: 12px; color: var(--muted);
+      border-top: 1px solid var(--border);
+    }
     .err { color: var(--red); }
   </style>
 </head>
 <body>
-  <main class="card">
-    <h1>gh-actions-consumer</h1>
-    <p class="sub">runner supervisor control</p>
-
+  <header>
+    <div class="brand">
+      <h1>gh-actions-consumer</h1>
+      <span class="sub">runner supervisor control</span>
+    </div>
     <div id="badge" class="badge"><span class="dot"></span><span id="badge-text">connecting…</span></div>
-
-    <div class="meter-label"><span>in flight</span><b><span id="in-flight">–</span> / <span id="max">–</span></b></div>
-    <div class="meter"><span id="meter-fill"></span></div>
-
+    <div class="meter-wrap">
+      <div class="meter-label"><span>in flight</span><b><span id="in-flight">–</span> / <span id="max">–</span></b></div>
+      <div class="meter"><span id="meter-fill"></span></div>
+    </div>
     <div class="buttons">
       <button id="pause">Pause</button>
       <button id="resume">Resume</button>
     </div>
+  </header>
 
-    <div class="foot">
-      <span id="error" class="err"></span>
-      <span id="updated"></span>
-    </div>
+  <nav class="tabs">
+    <a class="tab" href="#queued"    data-tab="queued">Queued</a>
+    <a class="tab" href="#inflight"  data-tab="inflight">In flight</a>
+    <a class="tab" href="#completed" data-tab="completed">Completed (24h)</a>
+  </nav>
+
+  <main>
+    <section id="tab-queued" class="panel">
+      <p id="queued-note" class="note" hidden></p>
+      <table>
+        <thead><tr><th>Job ID</th><th>Repo</th><th>Name</th><th>Labels</th><th>Queued</th><th></th></tr></thead>
+        <tbody id="queued-rows"></tbody>
+      </table>
+      <p id="queued-empty" class="empty">No queued jobs.</p>
+    </section>
+
+    <section id="tab-inflight" class="panel">
+      <p id="inflight-note" class="note" hidden></p>
+      <table>
+        <thead><tr><th>Job ID</th><th>Repo</th><th>Name</th><th>Labels</th><th>Running for</th><th></th></tr></thead>
+        <tbody id="inflight-rows"></tbody>
+      </table>
+      <p id="inflight-empty" class="empty">No jobs in flight.</p>
+    </section>
+
+    <section id="tab-completed" class="panel">
+      <p id="completed-note" class="note" hidden></p>
+      <table>
+        <thead><tr><th>Job ID</th><th>Repo</th><th>Name</th><th>Outcome</th><th>Finished</th><th>Reason</th></tr></thead>
+        <tbody id="completed-rows"></tbody>
+      </table>
+      <p id="completed-empty" class="empty">No completed jobs in the last 24h.</p>
+    </section>
   </main>
+
+  <div class="foot">
+    <span id="error" class="err"></span>
+    <span id="updated"></span>
+  </div>
   <script src="/app.js" defer></script>
 </body>
 </html>

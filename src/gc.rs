@@ -86,7 +86,7 @@ use crate::github::event::{Repository, WorkflowJob, WorkflowJobInfo};
 use crate::github::jit::{GhClient, JobStatus};
 use crate::lima::Lima;
 use crate::runner::vm_name;
-use crate::spool::{parse_spool_filename, sanitize_for_log, Spool};
+use crate::spool::{parse_spool_filename, sanitize_for_log, stamp_mtime_now, Spool};
 use crate::supervisor::{classify_job_labels, spawn_job, LabelVerdict};
 
 const VM_NAME_PREFIX: &str = "gha-";
@@ -580,8 +580,13 @@ async fn expire_stale_cur(
                 ),
             )
             .await;
-            if let Err(e) = tokio::fs::rename(&from, &to).await {
-                warn!(error = %e, "rename stale cur/ -> error/");
+            match tokio::fs::rename(&from, &to).await {
+                // rename preserves the claim-time mtime; stamp the archive to
+                // now so the "completed" view reads expiry (= finish) time, and
+                // a long-claimed job expired now isn't filtered out of the
+                // recent-completions window.
+                Ok(()) => stamp_mtime_now(&to),
+                Err(e) => warn!(error = %e, "rename stale cur/ -> error/"),
             }
         }
     }
@@ -1174,5 +1179,41 @@ mod tests {
         assert!(!is_managed_vm_name("gha-00000000000000000")); // 17
         assert!(!is_managed_vm_name("gha-zzzzzzzzzzzzzzzz"));
         assert!(!is_managed_vm_name("other-0000000000000001"));
+    }
+
+    /// A stale cur/ entry expired into error/ must carry an expiry-time mtime,
+    /// not the preserved claim-time one — otherwise a long-claimed job expired
+    /// now would be filtered out of the control UI's recent-completions window.
+    #[tokio::test]
+    async fn expire_stale_cur_stamps_archive_mtime_to_now() {
+        let dir = tempfile::tempdir().unwrap();
+        let cur = dir.path().join("cur");
+        let err = dir.path().join("error");
+        tokio::fs::create_dir_all(&cur).await.unwrap();
+        tokio::fs::create_dir_all(&err).await.unwrap();
+        let job = cur.join("60.job");
+        tokio::fs::write(&job, b"x").await.unwrap();
+        // Backdate well past the max age so it's expired.
+        let backdate = std::time::SystemTime::now() - std::time::Duration::from_secs(10_000);
+        std::fs::File::open(&job)
+            .unwrap()
+            .set_modified(backdate)
+            .unwrap();
+
+        let before = std::time::SystemTime::now();
+        expire_stale_cur(&cur, &err, 3600).await.unwrap();
+
+        let archived = err.join("60.job");
+        assert!(
+            archived.exists(),
+            "stale entry should be archived to error/"
+        );
+        let m = std::fs::metadata(&archived).unwrap().modified().unwrap();
+        assert!(
+            m >= before
+                .checked_sub(std::time::Duration::from_secs(2))
+                .unwrap(),
+            "expired archive mtime must be ~expiry time, not the backdated claim time; got {m:?}"
+        );
     }
 }

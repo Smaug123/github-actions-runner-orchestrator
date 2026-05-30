@@ -177,7 +177,7 @@ impl Spool {
                     }
                     return Ok(None);
                 }
-                stamp_claim_time(&to);
+                stamp_mtime_now(&to);
                 Ok(Some(to))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -211,9 +211,17 @@ impl Spool {
 
     pub async fn finalize_done(&self, cur_path: &Path) -> Result<()> {
         let name = cur_path.file_name().context("cur path has no filename")?;
-        archive(cur_path, &self.done_dir().join(name))
-            .await
-            .context("move to done/")
+        let dest = self.done_dir().join(name);
+        // archive renames, which preserves the source's claim-time mtime; stamp
+        // the archive to now so its mtime is the *completion* time the
+        // "completed" view (and future age-based pruning) reads. Stamp ONLY when
+        // archive actually installed our file — on the idempotent path (source
+        // already archived elsewhere) it leaves an existing marker untouched,
+        // and re-stamping that would make an old completion look fresh.
+        if archive(cur_path, &dest).await.context("move to done/")? {
+            stamp_mtime_now(&dest);
+        }
+        Ok(())
     }
 
     pub async fn finalize_error(&self, cur_path: &Path, reason: &str) -> Result<()> {
@@ -224,9 +232,12 @@ impl Spool {
         // Best-effort sidecar; if we can't write it, still attempt the rename
         // so the file doesn't get retried on next startup.
         let _ = fs::write(&err_path, reason).await;
-        archive(cur_path, &self.error_dir().join(name))
-            .await
-            .context("move to error/")
+        let dest = self.error_dir().join(name);
+        // Stamp completion time only on an actual install (see finalize_done).
+        if archive(cur_path, &dest).await.context("move to error/")? {
+            stamp_mtime_now(&dest);
+        }
+        Ok(())
     }
 
     /// Mint a `cur/<job_id>.job` record directly from authenticated GitHub API
@@ -307,7 +318,7 @@ impl Spool {
             .with_context(|| format!("write synthetic claim {name}"))?;
         match rename_no_clobber(&tmp, &dst) {
             Ok(()) => {
-                stamp_claim_time(&dst);
+                stamp_mtime_now(&dst);
                 Ok(Some(dst))
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -338,21 +349,27 @@ impl Spool {
 /// * dest occupied: the exclusive rename proved cur_path still exists, so
 ///   preserve the old marker then install ours; if cur_path vanishes in the
 ///   race window, restore the preserved copy so a marker survives.
-async fn archive(cur_path: &Path, dest: &Path) -> Result<()> {
+///
+/// Returns `true` iff this call actually installed `cur_path` at `dest`, and
+/// `false` on the idempotent no-op path (source already archived, existing
+/// marker left untouched). The caller stamps the completion mtime only on a
+/// real install — re-stamping an existing marker would make an old completion
+/// look fresh and reset its age for future pruning.
+async fn archive(cur_path: &Path, dest: &Path) -> Result<bool> {
     match rename_no_clobber(cur_path, dest) {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             warn!(cur = %cur_path.display(), "finalize: source already archived; leaving existing marker");
-            Ok(())
+            Ok(false)
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             let Some(bak) = preserve_existing(dest).await else {
                 // Marker vanished between the rename and now; just install ours.
                 fs::rename(cur_path, dest).await?;
-                return Ok(());
+                return Ok(true);
             };
             match fs::rename(cur_path, dest).await {
-                Ok(()) => Ok(()),
+                Ok(()) => Ok(true),
                 Err(e) => {
                     // Our source disappeared; put the preserved marker back so
                     // replay protection still sees an archive at `dest`.
@@ -411,16 +428,24 @@ async fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
 }
 
 /// Set a file's mtime to the current wall clock. Best-effort: any failure is
-/// logged and swallowed, because failing the claim over a missing utimens
-/// would be worse than the GC effect we're trying to dodge.
+/// logged (a missing file silently — that's an expected race) and swallowed,
+/// because failing a claim or finalize over a missing utimens would be worse
+/// than the clock effect we're trying to set.
+///
+/// Two uses, both wanting "stamp this file's clock to now":
+///   * after a claim renames `new/<name>` into cur/, so GC ages the in-flight
+///     job from when we took ownership (`gc::expire_stale_cur`);
+///   * after a finalize/expiry archives a file into done/ or error/, so the
+///     archive's mtime is its *completion* time. `rename(2)` preserves the
+///     source's mtime (= claim time), so without this the control UI's
+///     "completed" view — and the future mailbox-GC that prunes by age —
+///     would mistake claim time for finish time.
 ///
 /// Uses the same O_NOFOLLOW + O_NONBLOCK + post-open fstat dance as
-/// read_spool_file so a hostile `new/<name>` (symlink, FIFO, etc.) that was
-/// renamed into cur/ can't be opened through its target here. If the just-
-/// claimed file isn't a regular file we log and skip — read_spool_file
-/// will reject it on the same grounds and the supervisor will move it to
-/// error/.
-fn stamp_claim_time(p: &Path) {
+/// read_spool_file so a hostile file (symlink, FIFO, etc.) can't be opened
+/// through its target here. A non-regular file is logged and skipped —
+/// read_spool_file rejects it on the same grounds downstream.
+pub(crate) fn stamp_mtime_now(p: &Path) {
     let flags = libc::O_NOFOLLOW | libc::O_NONBLOCK;
     let file = match std::fs::OpenOptions::new()
         .read(true)
@@ -428,24 +453,28 @@ fn stamp_claim_time(p: &Path) {
         .open(p)
     {
         Ok(f) => f,
+        // A missing file is an expected race: a concurrent finalize won the
+        // archive, or the just-claimed file was finalized out from under us.
+        // Other open errors are worth a warn.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
         Err(e) => {
-            warn!(path = %p.display(), error = %e, "open for claim-time stamp");
+            warn!(path = %p.display(), error = %e, "open for mtime stamp");
             return;
         }
     };
     let md = match file.metadata() {
         Ok(m) => m,
         Err(e) => {
-            warn!(path = %p.display(), error = %e, "fstat for claim-time stamp");
+            warn!(path = %p.display(), error = %e, "fstat for mtime stamp");
             return;
         }
     };
     if !md.file_type().is_file() {
-        warn!(path = %p.display(), "claim-time stamp: not a regular file; skipping");
+        warn!(path = %p.display(), "mtime stamp: not a regular file; skipping");
         return;
     }
     if let Err(e) = file.set_modified(std::time::SystemTime::now()) {
-        warn!(path = %p.display(), error = %e, "set_modified after claim");
+        warn!(path = %p.display(), error = %e, "set_modified");
     }
 }
 
@@ -747,6 +776,93 @@ mod tests {
         assert_eq!(sidecar, "oh no");
     }
 
+    /// archive() renames, which preserves the claim-time mtime; finalize must
+    /// re-stamp the archived file to ~now so the control UI's "completed" view
+    /// (and future age-based pruning) reads finish time, not claim time.
+    #[tokio::test]
+    async fn finalize_done_stamps_archive_mtime_to_now() {
+        let (_dir, root) = spool_tmp().await;
+        let env = envelope("queued", 42, "o/r", 50, "sha256=00");
+        write_job(&root, "50.job", &env, b"{}").await;
+        let s = Spool::new(root.clone());
+        let cur = s.try_claim("50.job").await.unwrap().unwrap();
+        // Simulate a long-running job: backdate the claim mtime into the past.
+        let backdate = std::time::SystemTime::now() - Duration::from_secs(3 * 3600);
+        std::fs::File::open(&cur)
+            .unwrap()
+            .set_modified(backdate)
+            .unwrap();
+
+        let before = std::time::SystemTime::now();
+        s.finalize_done(&cur).await.unwrap();
+        let after = std::time::SystemTime::now();
+
+        let m = std::fs::metadata(root.join("done/50.job"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert!(
+            m >= before.checked_sub(Duration::from_secs(2)).unwrap()
+                && m <= after + Duration::from_secs(2),
+            "archive mtime must be finalize time, not the backdated claim time; got {m:?}"
+        );
+    }
+
+    /// The idempotent finalize path (source already archived, existing marker
+    /// kept) must NOT restamp that marker's mtime — doing so would make an old
+    /// completion look fresh and reset its age for future pruning.
+    #[tokio::test]
+    async fn finalize_does_not_restamp_existing_marker_when_source_gone() {
+        let (_dir, root) = spool_tmp().await;
+        let s = Spool::new(root.clone());
+        // A pre-existing archive marker with an OLD mtime, and NO cur/ source.
+        fs::write(root.join("done/90.job"), b"old").await.unwrap();
+        let old = std::time::SystemTime::now() - Duration::from_secs(3 * 3600);
+        std::fs::File::open(root.join("done/90.job"))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+
+        // finalize with a missing cur source: archive is a no-op that keeps the
+        // marker; the mtime must be left as-is.
+        s.finalize_done(&root.join("cur/90.job")).await.unwrap();
+
+        let m = std::fs::metadata(root.join("done/90.job"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert!(
+            m <= std::time::SystemTime::now() - Duration::from_secs(3600),
+            "idempotent finalize must not restamp an existing marker; got {m:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_error_stamps_archive_mtime_to_now() {
+        let (_dir, root) = spool_tmp().await;
+        let env = envelope("queued", 42, "o/r", 51, "sha256=00");
+        write_job(&root, "51.job", &env, b"{}").await;
+        let s = Spool::new(root.clone());
+        let cur = s.try_claim("51.job").await.unwrap().unwrap();
+        let backdate = std::time::SystemTime::now() - Duration::from_secs(3 * 3600);
+        std::fs::File::open(&cur)
+            .unwrap()
+            .set_modified(backdate)
+            .unwrap();
+
+        let before = std::time::SystemTime::now();
+        s.finalize_error(&cur, "boom").await.unwrap();
+
+        let m = std::fs::metadata(root.join("error/51.job"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert!(
+            m >= before.checked_sub(Duration::from_secs(2)).unwrap(),
+            "error archive mtime must be ~finalize time, not the backdated claim time; got {m:?}"
+        );
+    }
+
     #[tokio::test]
     async fn oversize_file_is_rejected() {
         let (_dir, root) = spool_tmp().await;
@@ -1006,7 +1122,7 @@ mod tests {
         assert!(!root.join("new/12.job").exists());
     }
 
-    /// stamp_claim_time must not follow a symlink that an attacker (or buggy
+    /// stamp_mtime_now must not follow a symlink that an attacker (or buggy
     /// spool) placed at new/<name> before we claimed it. rename(2) moves the
     /// symlink itself into cur/; if we then re-open without O_NOFOLLOW we'd
     /// touch the symlink target's mtime. With O_NOFOLLOW the open fails and
@@ -1034,12 +1150,12 @@ mod tests {
         let s = Spool::new(root.clone());
         let claimed = s.try_claim("8.job").await.unwrap();
         // The rename succeeds (we moved the link itself), but the secure
-        // O_NOFOLLOW open in stamp_claim_time refuses to follow it, so we
+        // O_NOFOLLOW open in stamp_mtime_now refuses to follow it, so we
         // never set_modified on the target.
         assert!(claimed.is_some(), "rename of the symlink itself succeeds");
 
         let post = std::fs::metadata(&target).unwrap().modified().unwrap();
-        assert_eq!(pre, post, "stamp_claim_time must not follow symlink");
+        assert_eq!(pre, post, "stamp_mtime_now must not follow symlink");
     }
 
     #[tokio::test]
