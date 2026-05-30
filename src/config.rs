@@ -99,6 +99,19 @@ pub struct Config {
     #[arg(long, env = "JOB_MAX_RUNTIME_SECS", default_value_t = 6 * 60 * 60)]
     pub job_max_runtime_secs: u64,
 
+    /// Seconds to retain finalized spool entries (done/ + error/) before the GC
+    /// sweep prunes them. 0 disables pruning (keeps the archive forever).
+    /// Default 2 days.
+    ///
+    /// NOTE (replay guard): done/ + error/ are also the archive `try_claim`
+    /// consults via `is_archived()` to reject a re-delivered webhook for an
+    /// already-finished job. Pruning past this window reopens that fast path for
+    /// such replays — bounded waste (at most one self-correcting run-once
+    /// runner; the reconciler is archive-agnostic). Keep this comfortably above
+    /// GitHub's webhook auto-redelivery window.
+    #[arg(long, env = "ARCHIVE_RETENTION_SECS", default_value_t = 2 * 24 * 60 * 60)]
+    pub archive_retention_secs: u64,
+
     /// Per-request HTTP timeout for GitHub API calls.
     #[arg(long, env = "GH_API_TIMEOUT_SECS", default_value_t = 60)]
     pub api_timeout_secs: u64,
@@ -262,6 +275,19 @@ impl Config {
                 "GH_API_URL must be https:// (got {:?}); set \
                  GH_INSECURE_ALLOW_HTTP_API=true only for local development",
                 self.api_url
+            );
+        }
+        // Soft warning (not fatal): a retention shorter than a job's max runtime
+        // could prune a job's archive while a sibling replay/steal might still
+        // arrive. 0 is the valid explicit "disable pruning" and is exempt.
+        if self.archive_retention_secs != 0
+            && self.archive_retention_secs < self.job_max_runtime_secs
+        {
+            tracing::warn!(
+                archive_retention_secs = self.archive_retention_secs,
+                job_max_runtime_secs = self.job_max_runtime_secs,
+                "ARCHIVE_RETENTION_SECS is below JOB_MAX_RUNTIME_SECS; an archived job \
+                 may be pruned while a replay/steal could still arrive"
             );
         }
         // Fail fast on a malformed/non-loopback control address rather than at

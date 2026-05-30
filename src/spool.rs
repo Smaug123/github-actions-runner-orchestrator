@@ -39,6 +39,7 @@ use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -75,6 +76,35 @@ pub struct Envelope {
     pub workflow_job_id: u64,
     pub received_at_ms: u128,
     pub signature: String,
+}
+
+/// Process-global serialization of archive-marker mutations in `done/` and
+/// `error/`.
+///
+/// Both `finalize_*` (which, on the supported steal/reconcile re-archive path,
+/// can install a *fresh* marker over an expired one of the same job id at the
+/// same path) and the GC prune (which deletes markers it has judged expired)
+/// take this lock around their mutate-the-marker critical section. Without it a
+/// prune that observed `done/<id>.job` as expired could, in the gap between that
+/// observation and its `remove_file`, unlink a fresh marker a concurrent
+/// finalize installed at that path — dropping the replay guard and completion
+/// record for a job that just finished. There is no portable atomic
+/// "unlink-this-inode" syscall, so mutual exclusion is the fix.
+///
+/// Sound because deployment is singleton per `SPOOL_DIR` (see the gc.rs header):
+/// every writer to these directories lives in this process. A single global
+/// mutex (rather than per-path) is fine — the critical sections are a couple of
+/// renames/stats and concurrency is bounded by `MAX_CONCURRENCY`.
+static ARCHIVE_MUTATION_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+/// Acquire the process-global archive-mutation lock. Held across the
+/// install-or-skip in `finalize_*` and the recheck-then-unlink in the GC prune.
+/// See [`ARCHIVE_MUTATION_LOCK`].
+pub async fn lock_archive_mutation() -> tokio::sync::MutexGuard<'static, ()> {
+    ARCHIVE_MUTATION_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await
 }
 
 pub struct Spool {
@@ -212,6 +242,10 @@ impl Spool {
     pub async fn finalize_done(&self, cur_path: &Path) -> Result<()> {
         let name = cur_path.file_name().context("cur path has no filename")?;
         let dest = self.done_dir().join(name);
+        // Serialize with the GC prune so it cannot unlink a marker we install
+        // here in the window between its expiry check and its delete (see
+        // lock_archive_mutation).
+        let _guard = lock_archive_mutation().await;
         // archive renames, which preserves the source's claim-time mtime; stamp
         // the archive to now so its mtime is the *completion* time the
         // "completed" view (and future age-based pruning) reads. Stamp ONLY when
@@ -226,6 +260,10 @@ impl Spool {
 
     pub async fn finalize_error(&self, cur_path: &Path, reason: &str) -> Result<()> {
         let name = cur_path.file_name().context("cur path has no filename")?;
+        // Serialize with the GC prune (see finalize_done / lock_archive_mutation).
+        // Held across the sidecar write too so the `.err` and its `.job` install
+        // as one unit relative to a prune pass.
+        let _guard = lock_archive_mutation().await;
         let err_path = self
             .error_dir()
             .join(format!("{}.err", name.to_string_lossy()));

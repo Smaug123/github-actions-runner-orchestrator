@@ -79,14 +79,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::sync::Semaphore;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
 use crate::github::event::{Repository, WorkflowJob, WorkflowJobInfo};
 use crate::github::jit::{GhClient, JobStatus};
 use crate::lima::Lima;
 use crate::runner::vm_name;
-use crate::spool::{parse_spool_filename, sanitize_for_log, stamp_mtime_now, Spool};
+use crate::spool::{
+    lock_archive_mutation, parse_spool_filename, sanitize_for_log, stamp_mtime_now, Spool,
+};
 use crate::supervisor::{classify_job_labels, spawn_job, LabelVerdict};
 
 const VM_NAME_PREFIX: &str = "gha-";
@@ -233,6 +235,19 @@ async fn sweep_inner(config: &Config, gh: &GhClient, lima: &Lima) -> anyhow::Res
         &cur_dir,
         &config.spool_dir.join("error"),
         config.job_max_runtime_secs,
+    )
+    .await?;
+
+    // Prune finalized entries (done/ + error/) past the retention window so the
+    // archive maildirs — which try_claim's replay check and the control UI both
+    // scan — don't grow without bound. Runs every GC_INTERVAL_SECS, ample for a
+    // multi-day window. Ordering vs expire_stale_cur is irrelevant: a claim it
+    // just aged into error/ gets a fresh (now) mtime and won't be pruned for a
+    // full retention window.
+    prune_old_archives(
+        &config.spool_dir.join("done"),
+        &config.spool_dir.join("error"),
+        config.archive_retention_secs,
     )
     .await?;
 
@@ -591,6 +606,144 @@ async fn expire_stale_cur(
         }
     }
     Ok(())
+}
+
+/// Prune finalized spool entries older than `retention_secs` from `done/` and
+/// `error/`.
+///
+/// `retention_secs == 0` disables pruning (keeps the archive forever) — an
+/// explicit switch so a misconfigured non-zero age can't be the only thing
+/// standing between the daemon and wiping the whole archive.
+///
+/// Each file is judged by its **own** mtime — the finalize-time `rename` +
+/// `stamp_mtime_now` sets it to completion time — so a `<id>.job`, its
+/// `<id>.job.err` sidecar, and any `<id>.job.<millis>.bak` are pruned
+/// independently. They're written within milliseconds of each other, so against
+/// a multi-day window they always fall on the same side, and independent
+/// deletion also sweeps orphaned sidecars/baks.
+///
+/// Best-effort, like `expire_stale_cur`: a per-file failure is logged and
+/// skipped, a missing dir is treated as empty — never fatal to the sweep.
+async fn prune_old_archives(
+    done_dir: &Path,
+    error_dir: &Path,
+    retention_secs: u64,
+) -> anyhow::Result<()> {
+    if retention_secs == 0 {
+        return Ok(());
+    }
+    for dir in [done_dir, error_dir] {
+        prune_archive_dir(dir, retention_secs).await;
+    }
+    Ok(())
+}
+
+/// Prune one archive dir in place. All failures are logged, never propagated; a
+/// missing dir is treated as empty.
+async fn prune_archive_dir(dir: &Path, retention_secs: u64) {
+    prune_archive_dir_inner(dir, retention_secs, None::<std::future::Ready<()>>).await
+}
+
+/// Test-seam variant. `between` (when `Some`) fires exactly once, after the
+/// first entry is judged expired by the directory-iteration stat and before the
+/// archive-mutation lock is taken — the window a concurrent `finalize_*`
+/// re-archive must hit. Production calls with `None`. Mirrors
+/// `Spool::try_claim_inner`'s `between_checks` seam.
+async fn prune_archive_dir_inner<F>(dir: &Path, retention_secs: u64, mut between: Option<F>)
+where
+    F: std::future::Future<Output = ()>,
+{
+    let mut rd = match tokio::fs::read_dir(dir).await {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            warn!(dir = %dir.display(), error = %e, "gc: archive dir unreadable during prune");
+            return;
+        }
+    };
+    let now = std::time::SystemTime::now();
+    let mut removed: u64 = 0;
+    let mut bytes_freed: u64 = 0;
+    loop {
+        let ent = match rd.next_entry().await {
+            Ok(Some(ent)) => ent,
+            Ok(None) => break,
+            Err(e) => {
+                warn!(dir = %dir.display(), error = %e, "gc: read_dir failed mid-prune; stopping dir");
+                break;
+            }
+        };
+        let md = match ent.metadata().await {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        // Only regular files: leave any subdir/symlink alone (checked before age
+        // so a non-regular entry is never a deletion candidate regardless of mtime).
+        if !md.is_file() {
+            continue;
+        }
+        let modified = md.modified().unwrap_or(now);
+        let age = now.duration_since(modified).unwrap_or_default();
+        if age.as_secs() <= retention_secs {
+            continue;
+        }
+        let name = ent.file_name();
+        let path = ent.path();
+        // Test seam: fire the injected hook in the exact window a concurrent
+        // re-archive would race (expired decision made, lock not yet held).
+        if let Some(hook) = between.take() {
+            hook.await;
+        }
+        // This entry looked expired by the directory-iteration stat, but a
+        // concurrent finalize_* could re-archive the same job id: `archive()`
+        // moves the old marker aside to `.bak` and installs a fresh-mtime
+        // done/<id>.job (or error/<id>.job) at this same path. Deleting by path
+        // on the stale stat would then unlink that fresh marker, dropping the
+        // replay guard and completion record for a job that just finished. There
+        // is no portable atomic unlink-this-inode, so we serialize against
+        // finalize via the process-global archive-mutation lock (sound because
+        // deployment is singleton per SPOOL_DIR — finalize_* is the only other
+        // writer). Held only around the recheck+unlink of an already-expired
+        // candidate, so finalize is never blocked for the whole scan.
+        let removed_entry = {
+            let _guard = lock_archive_mutation().await;
+            // Authoritative under the lock: no finalize can install a fresh
+            // marker while we hold it. symlink_metadata keeps the no-follow view.
+            let fresh = match tokio::fs::symlink_metadata(&path).await {
+                Ok(m) => m,
+                // Gone already (a prior finalize/sweep won); nothing to do.
+                Err(_) => continue,
+            };
+            // A re-archive stamps the marker to ~now, so a now-fresh file means
+            // finalize replaced it since the iteration stat: leave it.
+            if !fresh.is_file() {
+                continue;
+            }
+            let fresh_age = now
+                .duration_since(fresh.modified().unwrap_or(now))
+                .unwrap_or_default();
+            if fresh_age.as_secs() <= retention_secs {
+                continue;
+            }
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => Some((fresh.len(), fresh_age.as_secs())),
+                // Raced a sweep that removed it; not an error.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => {
+                    warn!(file = %sanitize_for_log(&name.to_string_lossy()), error = %e, "gc: failed to prune archived entry");
+                    None
+                }
+            }
+        };
+        if let Some((len, age_secs)) = removed_entry {
+            removed += 1;
+            bytes_freed += len;
+            debug!(file = %sanitize_for_log(&name.to_string_lossy()), age_secs, "gc: pruned archived entry");
+        }
+    }
+    if removed > 0 {
+        info!(dir = %dir.display(), removed, bytes_freed, "gc: pruned old archive entries");
+    }
 }
 
 /// Derive the expected vm_name for each cur/ file straight from its
@@ -1214,6 +1367,147 @@ mod tests {
                 .checked_sub(std::time::Duration::from_secs(2))
                 .unwrap(),
             "expired archive mtime must be ~expiry time, not the backdated claim time; got {m:?}"
+        );
+    }
+
+    // ---- prune_old_archives (filesystem-backed) ----
+
+    const TWO_DAYS: u64 = 2 * 24 * 60 * 60;
+
+    /// Backdate a file's mtime by `age_secs`, matching how the other fs tests
+    /// here simulate aged entries (std `File::set_modified`, no extra crate).
+    fn backdate(path: &Path, age_secs: u64) {
+        let t = std::time::SystemTime::now() - std::time::Duration::from_secs(age_secs);
+        std::fs::File::open(path).unwrap().set_modified(t).unwrap();
+    }
+
+    /// Fresh tempdir with `done/` + `error/`. The TempDir is returned so the
+    /// caller keeps it alive (dropping it deletes the tree).
+    async fn archive_dirs() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let done = dir.path().join("done");
+        let error = dir.path().join("error");
+        tokio::fs::create_dir_all(&done).await.unwrap();
+        tokio::fs::create_dir_all(&error).await.unwrap();
+        (dir, done, error)
+    }
+
+    #[tokio::test]
+    async fn prune_removes_old_and_keeps_fresh() {
+        let (_root, done, error) = archive_dirs().await;
+        let old_done = done.join("1.job");
+        let old_err = error.join("2.job");
+        let fresh = done.join("3.job");
+        for p in [&old_done, &old_err, &fresh] {
+            tokio::fs::write(p, b"{}").await.unwrap();
+        }
+        backdate(&old_done, TWO_DAYS + 3600);
+        backdate(&old_err, TWO_DAYS + 3600);
+        // `fresh` keeps its ~now mtime.
+
+        prune_old_archives(&done, &error, TWO_DAYS).await.unwrap();
+
+        assert!(!old_done.exists(), "old done/ entry should be pruned");
+        assert!(!old_err.exists(), "old error/ entry should be pruned");
+        assert!(fresh.exists(), "within-window entry should be kept");
+    }
+
+    #[tokio::test]
+    async fn prune_removes_error_sidecars_and_baks() {
+        let (_root, done, error) = archive_dirs().await;
+        let job = error.join("7.job");
+        let sidecar = error.join("7.job.err");
+        let bak = error.join("7.job.1700000000000.bak");
+        for p in [&job, &sidecar, &bak] {
+            tokio::fs::write(p, b"x").await.unwrap();
+            backdate(p, TWO_DAYS + 3600);
+        }
+
+        prune_old_archives(&done, &error, TWO_DAYS).await.unwrap();
+
+        assert!(!job.exists(), ".job pruned by its own mtime");
+        assert!(
+            !sidecar.exists(),
+            ".job.err sidecar pruned by its own mtime"
+        );
+        assert!(!bak.exists(), ".bak pruned by its own mtime");
+    }
+
+    #[tokio::test]
+    async fn prune_disabled_when_retention_zero() {
+        let (_root, done, error) = archive_dirs().await;
+        let ancient = done.join("1.job");
+        tokio::fs::write(&ancient, b"{}").await.unwrap();
+        backdate(&ancient, 3650 * 24 * 60 * 60);
+
+        prune_old_archives(&done, &error, 0).await.unwrap();
+
+        assert!(
+            ancient.exists(),
+            "retention_secs == 0 must disable pruning entirely"
+        );
+    }
+
+    #[tokio::test]
+    async fn prune_tolerates_missing_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        // Neither archive dir is created.
+        let done = dir.path().join("done");
+        let error = dir.path().join("error");
+        // Must not panic or return Err.
+        prune_old_archives(&done, &error, TWO_DAYS).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn prune_skips_non_regular() {
+        let (_root, done, error) = archive_dirs().await;
+        // A subdir in error/ must be left alone even if old. `is_file()` gates
+        // before the age check, so it's never a candidate; backdating it (best
+        // effort — opening a dir for set_modified isn't portable) just makes the
+        // "old" case explicit.
+        let subdir = error.join("old.subdir");
+        tokio::fs::create_dir_all(&subdir).await.unwrap();
+        let t = std::time::SystemTime::now() - std::time::Duration::from_secs(TWO_DAYS + 3600);
+        let _ = std::fs::File::open(&subdir).and_then(|f| f.set_modified(t));
+
+        prune_old_archives(&done, &error, TWO_DAYS).await.unwrap();
+
+        assert!(subdir.exists(), "non-regular entries must be skipped");
+    }
+
+    #[tokio::test]
+    async fn prune_keeps_marker_rearchived_during_scan() {
+        let (_root, done, _error) = archive_dirs().await;
+        // An expired canonical marker — e.g. a stolen completion archived earlier.
+        let marker = done.join("5.job");
+        tokio::fs::write(&marker, b"old").await.unwrap();
+        backdate(&marker, TWO_DAYS + 3600);
+
+        // The hook stands in for a concurrent finalize_* re-archiving the same id
+        // in the race window (expired decision made, lock not yet held): move the
+        // expired marker aside to a .bak and install a fresh-mtime marker, exactly
+        // as archive() + stamp_mtime_now do. The locked recheck must then observe
+        // it as fresh and refuse to delete it. Without the recheck (deleting by
+        // the stale iteration stat) this would unlink the just-finished job's
+        // marker, dropping its replay guard and completion record.
+        let marker_h = marker.clone();
+        let done_h = done.clone();
+        let hook = async move {
+            let bak = done_h.join("5.job.1700000000000.bak");
+            tokio::fs::rename(&marker_h, &bak).await.unwrap();
+            tokio::fs::write(&marker_h, b"fresh").await.unwrap();
+        };
+
+        prune_archive_dir_inner(&done, TWO_DAYS, Some(hook)).await;
+
+        assert!(
+            marker.exists(),
+            "a marker re-archived during the scan must survive the prune"
+        );
+        assert_eq!(
+            tokio::fs::read(&marker).await.unwrap(),
+            b"fresh",
+            "the surviving marker must be the freshly re-archived one"
         );
     }
 }
