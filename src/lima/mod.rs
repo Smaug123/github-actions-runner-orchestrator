@@ -29,7 +29,9 @@ use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::process::Command;
+use tracing::warn;
 
 pub struct Lima {
     bin: PathBuf,
@@ -203,6 +205,88 @@ impl Lima {
         }
         Ok(parse_list_json(&out.stdout))
     }
+
+    /// Read the tail of a VM's guest serial console, if one exists.
+    ///
+    /// Lima mirrors the guest kernel console to a file in the per-instance
+    /// directory: `serialv.log` under the vz driver (our `runner-aarch64.yaml`)
+    /// and `serial.log` under qemu. We resolve that directory the same way GC
+    /// does — the `.Dir` field of `limactl list --json` — then try the vz name
+    /// first and fall back to the qemu one. `Ok(None)` when the VM is gone, has
+    /// no dir, or carries neither log; those are expected races, not errors.
+    ///
+    /// Only the last `max_bytes` are returned. The console accumulates the whole
+    /// boot log, but a kernel OOM-killer report is at the *end* (the death), so
+    /// a bounded tail keeps this cheap and never slurps a pathologically large
+    /// file. This costs one extra `limactl list` per call; callers invoke it
+    /// once per job, which is negligible against a VM lifecycle.
+    pub async fn serial_log_tail(&self, name: &str, max_bytes: u64) -> Result<Option<String>> {
+        let instances = self
+            .list_instances()
+            .await
+            .context("list instances to locate serial console")?;
+        let Some((_, Some(dir))) = instances.into_iter().find(|(n, _)| n == name) else {
+            return Ok(None);
+        };
+        for fname in ["serialv.log", "serial.log"] {
+            let path = dir.join(fname);
+            match read_file_tail(&path, max_bytes).await {
+                Ok(Some(tail)) => return Ok(Some(tail)),
+                Ok(None) => continue,
+                // A readable dir whose log we can't read is worth a warn, but
+                // never fatal — diagnostics must not fail a job's teardown.
+                Err(e) => {
+                    warn!(path = %path.display(), error = %format!("{e:#}"), "read serial console tail")
+                }
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// Read the last `max_bytes` of a file as lossy UTF-8. `Ok(None)` if the file
+/// does not exist (an expected race — the VM may have been reaped) or is not a
+/// regular file. Seeks to `len - max_bytes` so a large console log costs only a
+/// bounded read.
+///
+/// Opened with `O_NOFOLLOW | O_NONBLOCK` + a post-open fstat regular-file check,
+/// the same hardening `spool::read_spool_file` uses: this runs before
+/// `teardown()` frees the VM slot, so a symlink or FIFO named `serialv.log` in a
+/// tampered instance dir must not be followed or block the open indefinitely.
+async fn read_file_tail(path: &Path, max_bytes: u64) -> Result<Option<String>> {
+    let flags = libc::O_NOFOLLOW | libc::O_NONBLOCK;
+    let mut f = match tokio::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(flags)
+        .open(path)
+        .await
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("open {}", path.display())),
+    };
+    // fstat the open fd (no TOCTOU): a FIFO/dir/socket named serialv.log lands
+    // here; a symlink was already refused by O_NOFOLLOW above. Skip, don't read.
+    let md = f
+        .metadata()
+        .await
+        .with_context(|| format!("fstat {}", path.display()))?;
+    if !md.file_type().is_file() {
+        warn!(path = %path.display(), "serial console path is not a regular file; skipping");
+        return Ok(None);
+    }
+    let len = md.len();
+    if len > max_bytes {
+        f.seek(std::io::SeekFrom::Start(len - max_bytes))
+            .await
+            .with_context(|| format!("seek {}", path.display()))?;
+    }
+    let mut buf = Vec::with_capacity(len.min(max_bytes) as usize);
+    f.take(max_bytes)
+        .read_to_end(&mut buf)
+        .await
+        .with_context(|| format!("read {}", path.display()))?;
+    Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
 }
 
 /// One row of `limactl list --json`. We only read the fields we use; the JSON
@@ -295,5 +379,60 @@ mod tests {
     fn parse_list_json_empty_is_empty() {
         assert!(parse_list_json(b"").is_empty());
         assert!(parse_list_json(b"\n\n").is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_file_tail_returns_last_bytes_or_whole_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("serialv.log");
+        tokio::fs::write(&p, b"0123456789abcdef").await.unwrap();
+        // Tail smaller than the file: only the last bytes.
+        assert_eq!(
+            read_file_tail(&p, 4).await.unwrap().as_deref(),
+            Some("cdef")
+        );
+        // Cap larger than the file: the whole file.
+        assert_eq!(
+            read_file_tail(&p, 1024).await.unwrap().as_deref(),
+            Some("0123456789abcdef")
+        );
+        // Cap exactly the file length: the whole file (no seek).
+        assert_eq!(
+            read_file_tail(&p, 16).await.unwrap().as_deref(),
+            Some("0123456789abcdef")
+        );
+    }
+
+    #[tokio::test]
+    async fn read_file_tail_missing_file_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope.log");
+        assert_eq!(read_file_tail(&missing, 64).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn read_file_tail_skips_non_regular_file() {
+        // A directory where a serialv.log is expected: the post-open fstat
+        // regular-file check returns None rather than trying to read it.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("serialv.log");
+        std::fs::create_dir(&p).unwrap();
+        assert_eq!(read_file_tail(&p, 64).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn read_file_tail_does_not_follow_symlink() {
+        // O_NOFOLLOW must refuse a symlink at the log path so a tampered
+        // instance dir can't redirect the read at a daemon-readable file.
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("secret");
+        std::fs::write(&secret, b"do not read through").unwrap();
+        let link = dir.path().join("serialv.log");
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+        let got = read_file_tail(&link, 64).await;
+        assert!(
+            !matches!(&got, Ok(Some(s)) if s.contains("do not read through")),
+            "must not read through a symlink, got {got:?}"
+        );
     }
 }

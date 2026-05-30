@@ -26,7 +26,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::github::event::WorkflowJob;
@@ -73,6 +73,18 @@ pub async fn run_job(
         .context("mint JIT runner config")?;
 
     let inner = run_in_vm(&job, &vm_name, &config, &lima, &jit).await;
+    // Capture the guest serial console BEFORE teardown deletes the VM (and its
+    // serialv.log with it). Runs regardless of `inner`: an in-guest build OOM
+    // kills the build but the runner agent still exits 0, so the job finalizes
+    // to done/ — an error-only capture would miss exactly that case.
+    capture_oom_evidence(
+        &vm_name,
+        job.event.workflow_job.id,
+        &config,
+        &lima,
+        inner.is_ok(),
+    )
+    .await;
     teardown(
         &vm_name,
         &config,
@@ -84,6 +96,96 @@ pub async fn run_job(
     )
     .await;
     inner
+}
+
+/// Bytes of guest serial console to scan for an OOM. The kernel OOM-killer
+/// report and its surrounding dmesg context sit at the end of the log, so the
+/// tail is enough and keeps the per-job read bounded.
+const SERIAL_TAIL_BYTES: u64 = 64 * 1024;
+
+/// Best-effort: before teardown destroys the VM, scan the guest serial console
+/// for a kernel OOM and, if found, log it and preserve the tail for forensics.
+///
+/// Keys off the OOM signature in the console, NOT the job's pass/fail: the
+/// failure we're chasing (an in-guest build OOM, surfacing in the runner log as
+/// `build hook / unexpected EOF`) leaves the runner agent exiting 0, so the job
+/// finalizes to done/. `inner_ok` only colors the log line for correlation.
+///
+/// Every failure here is logged and swallowed — capturing diagnostics must
+/// never fail a job or delay the VM teardown that frees a concurrency slot.
+async fn capture_oom_evidence(vm: &str, job_id: u64, config: &Config, lima: &Lima, inner_ok: bool) {
+    let tail = match lima.serial_log_tail(vm, SERIAL_TAIL_BYTES).await {
+        Ok(Some(t)) => t,
+        Ok(None) => return,
+        Err(e) => {
+            warn!(vm, error = %format!("{e:#}"), "could not read guest serial console for OOM check");
+            return;
+        }
+    };
+    let Some(oom_line) = detect_guest_oom(&tail) else {
+        return;
+    };
+    warn!(
+        vm,
+        job_id,
+        finalized = if inner_ok { "done" } else { "error" },
+        oom_line = %sanitize_for_log(oom_line),
+        "guest OOM detected on serial console (VM died of in-guest memory pressure, not host)"
+    );
+    let dest = config
+        .state_dir
+        .join("logs")
+        .join(format!("{vm}.serial.log"));
+    match write_serial_evidence(&dest, tail.as_bytes()).await {
+        Ok(()) => {
+            info!(vm, path = %dest.display(), "preserved guest serial console tail for OOM forensics")
+        }
+        Err(e) => {
+            warn!(vm, path = %dest.display(), error = %format!("{e:#}"), "could not preserve serial console tail")
+        }
+    }
+}
+
+/// Scan a guest serial-console tail for the Linux OOM-killer's signature,
+/// returning the first matching line. The kernel emits `… Out of memory: Killed
+/// process …` (and, for a cgroup limit, `Memory cgroup out of memory: …`) plus
+/// an `oom-kill:` constraint line when it reaps a process to reclaim RAM.
+/// Finding one means the *guest* ran out of memory and killed the build —
+/// distinct from an incidental build failure, which leaves no such line. The
+/// match is case-insensitive over the kernel's wording; we scan the console
+/// (kernel dmesg), not the build's stdout (which the runner streams to GitHub),
+/// so false positives are unlikely. Pure, so it's unit-tested directly.
+fn detect_guest_oom(serial_tail: &str) -> Option<&str> {
+    serial_tail.lines().find(|line| {
+        let l = line.to_ascii_lowercase();
+        l.contains("out of memory") || l.contains("oom-kill:")
+    })
+}
+
+/// Write the serial-console tail to `path` owner-only (0600), overwriting any
+/// prior capture for this VM (names are job-id-derived, so a re-capture reuses
+/// the name). We unlink then `create_new` with `O_NOFOLLOW | O_NONBLOCK` rather
+/// than truncate in place: `.mode()` only applies on creation, so an existing
+/// symlink/FIFO or lax-perms file would otherwise be followed, truncated, or
+/// block us — and this runs on OOM before the worker releases its VM slot. The
+/// unlink+create races nobody: `state_dir/logs` is 0700 ours (same assumption
+/// `stage_trusted_template` makes), so the file is born owner-only.
+async fn write_serial_evidence(path: &std::path::Path, contents: &[u8]) -> Result<()> {
+    match fs::remove_file(path).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("remove stale {}", path.display())),
+    }
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .mode(0o600)
+        .open(path)
+        .await?;
+    f.write_all(contents).await?;
+    f.sync_all().await?;
+    Ok(())
 }
 
 async fn run_in_vm(
@@ -236,6 +338,67 @@ mod tests {
                     .map(|e| e.kind() == std::io::ErrorKind::AlreadyExists)
                     .unwrap_or(false)
         );
+    }
+
+    #[tokio::test]
+    async fn write_serial_evidence_replaces_symlink_without_clobbering_target() {
+        // A hostile/stale symlink sits at the evidence path. The unlink +
+        // create_new(O_NOFOLLOW) must replace it with a fresh 0600 regular file
+        // and leave whatever the link pointed at untouched.
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("secret");
+        std::fs::write(&secret, b"untouched").unwrap();
+        let dest = dir.path().join("gha-0000000000000001.serial.log");
+        std::os::unix::fs::symlink(&secret, &dest).unwrap();
+
+        write_serial_evidence(&dest, b"evidence").await.unwrap();
+
+        assert_eq!(std::fs::read(&secret).unwrap(), b"untouched");
+        let md = std::fs::symlink_metadata(&dest).unwrap();
+        assert!(md.file_type().is_file(), "dest must be a regular file now");
+        assert_eq!(md.mode() & 0o777, 0o600);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"evidence");
+    }
+
+    #[test]
+    fn detect_guest_oom_matches_kernel_oom_report() {
+        // A real OOM-killer report as it appears on the guest serial console,
+        // with the `oom-kill:` constraint line and the `Out of memory: Killed
+        // process` line. The first match (the oom-kill: line here) is returned.
+        let tail = "[  123.456] systemd[1]: Started some.service\n\
+             [  200.123] kernel: nix-daemon invoked oom-killer: gfp_mask=0x...\n\
+             [  200.130] kernel: oom-kill:constraint=CONSTRAINT_NONE,nodemask=(null)\n\
+             [  200.140] kernel: Out of memory: Killed process 4567 (nix-daemon) total-vm:...\n";
+        let hit = detect_guest_oom(tail).expect("OOM report must be detected");
+        assert!(
+            hit.contains("oom-kill:") || hit.contains("Out of memory"),
+            "matched line should be an OOM line, got {hit:?}"
+        );
+    }
+
+    #[test]
+    fn detect_guest_oom_matches_cgroup_oom_case_insensitively() {
+        let tail = "kernel: Memory cgroup out of memory: Killed process 99 (cc1plus)\n";
+        assert!(
+            detect_guest_oom(tail).is_some(),
+            "cgroup OOM (lowercase 'out of memory') must match"
+        );
+    }
+
+    #[test]
+    fn detect_guest_oom_ignores_clean_and_eof_only_logs() {
+        // The build-hook EOF symptom with NO kernel OOM line: memory was
+        // incidental, so we must NOT cry OOM. (This string is what the runner
+        // streams to GitHub, not the serial console — included to prove the
+        // detector doesn't false-positive on it.)
+        let eof_only = "[  10.0] systemd[1]: Reached target multi-user.target\n\
+             runner: nix: while reading the response from the build hook: unexpected EOF reading a line\n";
+        assert_eq!(detect_guest_oom(eof_only), None);
+        assert_eq!(
+            detect_guest_oom("normal boot log\nlocalhost login: \n"),
+            None
+        );
+        assert_eq!(detect_guest_oom(""), None);
     }
 
     #[test]
