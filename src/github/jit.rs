@@ -6,13 +6,22 @@
 // runner groups, and runners registered against a repo live in that repo's
 // default group (id 1). The runner-group concept is gone entirely.
 
+use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
 
-use super::installation::Installations;
+use super::installation::{Installations, ScopedPermissions};
+
+/// How long a repo's default branch is cached. It changes rarely, and the
+/// warmer reads it on every candidate job, so a coarse TTL keeps us off the API
+/// without risking a meaningfully stale answer.
+const DEFAULT_BRANCH_TTL: Duration = Duration::from_secs(60 * 60);
 
 /// Repository runners always belong to the repo's default runner group, whose
 /// id is 1. The repo-scoped generate-jitconfig endpoint still requires the
@@ -95,11 +104,36 @@ struct RunJobsResp {
     jobs: Vec<JobStatus>,
 }
 
+/// `GET /repos/{owner}/{repo}` — only the default branch is of interest.
+#[derive(Deserialize)]
+struct RepoInfo {
+    default_branch: String,
+}
+
+/// `GET /repos/{owner}/{repo}/branches/{branch}` — only the tip commit sha.
+#[derive(Deserialize)]
+struct BranchInfo {
+    commit: BranchCommit,
+}
+
+#[derive(Deserialize)]
+struct BranchCommit {
+    sha: String,
+}
+
+struct CachedDefaultBranch {
+    branch: String,
+    valid_until: Instant,
+}
+
 pub struct GhClient {
     api: String,
     http: Client,
     account: String,
     installations: Arc<Installations>,
+    /// Per-repo default-branch cache (keyed `owner/repo`). Bounded by the
+    /// allowlist the warmer queries; entries refresh on read past their TTL.
+    default_branch_cache: Mutex<HashMap<String, CachedDefaultBranch>>,
 }
 
 impl GhClient {
@@ -114,11 +148,112 @@ impl GhClient {
             http,
             account,
             installations,
+            default_branch_cache: Mutex::new(HashMap::new()),
         }
     }
 
     async fn token(&self) -> Result<String> {
         self.installations.token(&self.account).await
+    }
+
+    /// Mint a token scoped to a single repository carrying only
+    /// `contents: read`, for the cache warmer's private-flake fetch. Never
+    /// cached; the caller writes it to a `0600` netrc and drops it after the
+    /// build. Deliberately *not* the broad installation `token()`.
+    #[allow(dead_code)] // consumed by the cache warmer (a later slice)
+    pub async fn contents_read_token(&self, repo_id: u64) -> Result<String> {
+        let perms = ScopedPermissions {
+            contents: Some("read"),
+        };
+        self.installations
+            .scoped_token(&self.account, &[repo_id], &perms)
+            .await
+    }
+
+    /// The repository's default branch (e.g. `main`). Cached per-repo with a
+    /// TTL — it changes rarely and the warmer reads it on every candidate job.
+    /// Uses the installation token (`Metadata: read`, always granted).
+    #[allow(dead_code)] // consumed by the cache warmer (a later slice)
+    pub async fn default_branch(&self, owner: &str, repo: &str) -> Result<String> {
+        let key = format!("{}/{}", owner, repo);
+        {
+            let cache = self.default_branch_cache.lock().await;
+            if let Some(c) = cache.get(&key) {
+                if c.valid_until > Instant::now() {
+                    return Ok(c.branch.clone());
+                }
+            }
+        }
+        let tok = self.token().await?;
+        let url = format!("{}/repos/{}/{}", self.api, owner, repo);
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&tok)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .send()
+            .await
+            .context("GET /repos/{owner}/{repo}")?;
+        if !resp.status().is_success() {
+            anyhow::bail!(
+                "default_branch {}/{}: {} {}",
+                owner,
+                repo,
+                resp.status(),
+                resp.text().await.unwrap_or_default()
+            );
+        }
+        let body: RepoInfo = resp.json().await?;
+        {
+            let mut cache = self.default_branch_cache.lock().await;
+            cache.insert(
+                key,
+                CachedDefaultBranch {
+                    branch: body.default_branch.clone(),
+                    valid_until: Instant::now() + DEFAULT_BRANCH_TTL,
+                },
+            );
+        }
+        Ok(body.default_branch)
+    }
+
+    /// The current tip commit sha of `branch`. The warmer compares this against
+    /// the triggering job's `head_sha`, warming only a build that is still the
+    /// live default-branch tip. `branch` is a live API value (not always
+    /// `main`) and may contain URL-reserved characters, so it is
+    /// percent-encoded into the path segment. Uses the installation token.
+    #[allow(dead_code)] // consumed by the cache warmer (a later slice)
+    pub async fn branch_tip(&self, owner: &str, repo: &str, branch: &str) -> Result<String> {
+        let tok = self.token().await?;
+        let url = format!(
+            "{}/repos/{}/{}/branches/{}",
+            self.api,
+            owner,
+            repo,
+            encode_path_segment(branch)
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&tok)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .send()
+            .await
+            .context("GET /repos/{owner}/{repo}/branches/{branch}")?;
+        if !resp.status().is_success() {
+            anyhow::bail!(
+                "branch_tip {}/{} {}: {} {}",
+                owner,
+                repo,
+                branch,
+                resp.status(),
+                resp.text().await.unwrap_or_default()
+            );
+        }
+        let body: BranchInfo = resp.json().await?;
+        Ok(body.commit.sha)
     }
 
     /// Mint a JIT runner config bound to a specific repository. A runner
@@ -387,6 +522,28 @@ impl GhClient {
     }
 }
 
+/// Percent-encode one URL path segment per RFC 3986: pass through only the
+/// "unreserved" characters (`A-Z a-z 0-9 - . _ ~`) and `%XX`-escape every other
+/// byte. Branch names arrive as live API values and can legitimately contain
+/// `/`, `#`, `?`, `&`, `%` (`release/1.0`, `feat#42`); interpolated raw they
+/// would split the path, open a query string, or otherwise corrupt the request
+/// URL. Encoding everything non-unreserved keeps the value inside one segment.
+fn encode_path_segment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            // write! to a String is infallible.
+            _ => {
+                let _ = write!(out, "%{:02X}", b);
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -434,6 +591,36 @@ mod tests {
         assert_eq!(r.workflow_runs.len(), 1);
         assert_eq!(r.workflow_runs[0].id, 555);
         assert_eq!(r.workflow_runs[0].repository.id, 7);
+    }
+
+    #[test]
+    fn parses_repo_default_branch() {
+        let r: RepoInfo =
+            serde_json::from_str(r#"{"id":1,"default_branch":"trunk","private":true}"#).unwrap();
+        assert_eq!(r.default_branch, "trunk");
+    }
+
+    #[test]
+    fn parses_branch_tip_sha() {
+        let json = r#"{
+            "name": "main",
+            "commit": {"sha": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", "url": "..."},
+            "protected": false
+        }"#;
+        let b: BranchInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(b.commit.sha, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
+    }
+
+    #[test]
+    fn percent_encodes_reserved_branch_chars() {
+        // A slashed branch must stay one path segment.
+        assert_eq!(encode_path_segment("release/1.0"), "release%2F1.0");
+        // Other URL-reserved characters that git refs allow.
+        assert_eq!(encode_path_segment("feat#42"), "feat%2342");
+        assert_eq!(encode_path_segment("a&b"), "a%26b");
+        // Unreserved characters pass through untouched.
+        assert_eq!(encode_path_segment("main"), "main");
+        assert_eq!(encode_path_segment("dependabot-_.~"), "dependabot-_.~");
     }
 
     #[test]

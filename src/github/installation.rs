@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use reqwest::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, OnceCell};
 use zeroize::Zeroizing;
 
@@ -36,6 +36,23 @@ struct Installation {
 #[derive(Deserialize)]
 struct TokenResp {
     token: String,
+}
+
+/// The `permissions` object of a down-scoped token mint. Only the subsets the
+/// cache warmer needs are modelled; `None` fields are omitted from the request
+/// so the minted token carries no permission we did not explicitly ask for.
+#[derive(Serialize, Default)]
+pub struct ScopedPermissions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contents: Option<&'static str>,
+}
+
+/// Request body for a down-scoped installation-token mint: limit the token to
+/// `repository_ids` and `permissions` instead of the installation-wide default.
+#[derive(Serialize)]
+struct ScopedTokenReq<'a> {
+    repository_ids: &'a [u64],
+    permissions: &'a ScopedPermissions,
 }
 
 #[derive(Clone)]
@@ -140,5 +157,85 @@ impl Installations {
             *cache = Some(cached);
         }
         Ok(body.token)
+    }
+
+    /// Mint a fresh installation token **down-scoped** to `repository_ids` with
+    /// only `permissions`, bypassing the shared cache entirely.
+    ///
+    /// The cached `token()` above carries every permission the App was granted
+    /// across every installed repo (the mint sends no body). The cache warmer
+    /// needs the opposite: a short-lived token limited to one repo and
+    /// `contents: read`, written to a `0600` netrc and discarded after use. So
+    /// this never reads or writes the cache — each call is its own mint — and
+    /// the result is the caller's to hold briefly and drop.
+    #[allow(dead_code)] // consumed by the cache warmer (a later slice)
+    pub async fn scoped_token(
+        &self,
+        account: &str,
+        repository_ids: &[u64],
+        permissions: &ScopedPermissions,
+    ) -> Result<String> {
+        // Reuses the OnceCell-cached installation id; only the token mint is
+        // uncached.
+        let id = self.installation_id(account).await?;
+        let jwt = app_jwt::mint(self.auth.app_id, &self.auth.pem)?;
+        let url = format!("{}/app/installations/{}/access_tokens", self.api, id);
+        let req = ScopedTokenReq {
+            repository_ids,
+            permissions,
+        };
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&jwt)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .json(&req)
+            .send()
+            .await
+            .context("POST /app/installations/{id}/access_tokens (scoped)")?;
+        if !resp.status().is_success() {
+            anyhow::bail!(
+                "scoped token mint: {} {}",
+                resp.status(),
+                resp.text().await.unwrap_or_default()
+            );
+        }
+        let body: TokenResp = resp.json().await?;
+        Ok(body.token)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scoped_token_body_shape() {
+        // The mint must request exactly one repo id and only contents:read —
+        // no broader permission leaks into the body.
+        let perms = ScopedPermissions {
+            contents: Some("read"),
+        };
+        let req = ScopedTokenReq {
+            repository_ids: &[7],
+            permissions: &perms,
+        };
+        let got = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            got,
+            serde_json::json!({
+                "repository_ids": [7],
+                "permissions": { "contents": "read" }
+            })
+        );
+    }
+
+    #[test]
+    fn scoped_permissions_omit_unset_fields() {
+        // An empty permissions set serializes to `{}` — never a null that GitHub
+        // might read as "grant everything".
+        let got = serde_json::to_value(ScopedPermissions::default()).unwrap();
+        assert_eq!(got, serde_json::json!({}));
     }
 }
