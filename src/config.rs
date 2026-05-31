@@ -239,6 +239,29 @@ pub struct Config {
     /// single build. 0 disables coalescing (every qualifying job warms).
     #[arg(long, env = "WARM_COALESCE_TTL_SECS", default_value_t = 10 * 60)]
     pub warm_coalesce_ttl_secs: u64,
+
+    /// Hard timeout for each warmer child (warm-flake-inputs.sh, `nix build`,
+    /// warm-cache.sh); a child still running at the deadline is killed. Default
+    /// 30 minutes — a cold crane build is slow. Validated >= 1 when enabled.
+    #[arg(long, env = "WARM_TIMEOUT_SECS", default_value_t = 30 * 60)]
+    pub warm_timeout_secs: u64,
+
+    /// `substituters` the warmer pins for its hardened build, overriding
+    /// whatever the untrusted flake's nixConfig might request. Space-separated;
+    /// default is the Mac cache (reached at loopback on the host) then
+    /// cache.nixos.org.
+    #[arg(
+        long,
+        env = "WARM_SUBSTITUTERS",
+        default_value = "http://127.0.0.1:8080 https://cache.nixos.org"
+    )]
+    pub warm_substituters: String,
+
+    /// `trusted-public-keys` the warmer pins (space-separated). Empty (default)
+    /// means derive at startup: the Mac cache pubkey from
+    /// `<WARM_CACHE_BASE>/keys/<name>.public` plus the cache.nixos.org key.
+    #[arg(long, env = "WARM_TRUSTED_PUBLIC_KEYS", default_value = "")]
+    pub warm_trusted_public_keys: String,
 }
 
 fn default_runner_labels() -> Vec<String> {
@@ -308,6 +331,20 @@ impl Config {
         if self.warm_max_concurrency == 0 {
             anyhow::bail!("WARM_MAX_CONCURRENCY must be >= 1 when CACHE_WARM_ENABLED");
         }
+        // A zero timeout would kill every warmer child the instant it starts.
+        if self.warm_timeout_secs == 0 {
+            anyhow::bail!("WARM_TIMEOUT_SECS must be >= 1 when CACHE_WARM_ENABLED");
+        }
+        // The warmer writes its per-warm netrc under STATE_DIR and interpolates
+        // that path into the private nix.conf's `netrc-file`, which nix rejects
+        // unless it is absolute. Require an absolute STATE_DIR up front rather
+        // than failing every warm.
+        if !self.state_dir.is_absolute() {
+            anyhow::bail!(
+                "STATE_DIR must be an absolute path when CACHE_WARM_ENABLED (it is interpolated \
+                 into the warmer's private nix.conf netrc-file, which nix rejects if relative)"
+            );
+        }
         // Clone the configured paths so the validation below holds no borrow of
         // `self` when we write the canonical NIX_BIN back at the end.
         let nix_bin = self
@@ -348,6 +385,11 @@ impl Config {
                     nix_bin.display()
                 )
             })?;
+        // The warmer pins this binary's *directory* onto the child PATH, so it
+        // must not itself carry the PATH separator.
+        if let Some(bin_dir) = nix_real.parent() {
+            reject_path_separator(bin_dir, "NIX_BIN directory")?;
+        }
         // Pin the *canonical* store path back into config: the warmer derives
         // `nix-store` and the PATH-pinned bin dir from this, so a NIX_BIN whose
         // ancestor is a symlink that currently resolves into the store (but
@@ -394,6 +436,8 @@ impl Config {
         // Tools dir holding jq (resolved by name from the pinned child PATH).
         verify_trusted_dir(&tools_dir)
             .with_context(|| format!("WARM_TOOLS_DIR {}", tools_dir.display()))?;
+        // It is interpolated verbatim into that PATH, so it must be colon-free.
+        reject_path_separator(&tools_dir, "WARM_TOOLS_DIR")?;
         let jq = tools_dir.join("jq");
         verify_trusted_executable(&jq).with_context(|| format!("jq {}", jq.display()))?;
 
@@ -769,6 +813,24 @@ pub(crate) fn verify_trusted_dir(p: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Reject a `:` in a directory that the warmer joins into its child PATH. `:` is
+/// a legal byte in a Unix path but the PATH separator, so a colon-bearing dir
+/// would split into *extra, unvalidated* PATH entries — and a script shebang
+/// (`/usr/bin/env bash`) or `warm-flake-inputs.sh`'s name-resolved `jq`/`nix`
+/// could then exec a binary from a directory we never trust-checked. The other
+/// PATH members are fixed root-owned system dirs (colon-free), and HOME/XDG_*
+/// ride single env vars (not split), so only the two configured dirs need this.
+fn reject_path_separator(dir: &Path, name: &str) -> Result<()> {
+    if dir.to_string_lossy().contains(':') {
+        anyhow::bail!(
+            "{name} {} contains ':', which would split the warmer's child PATH into \
+             unvalidated search entries; use a colon-free path",
+            dir.display()
+        );
+    }
+    Ok(())
+}
+
 /// Validate a private key the warmer's signer reads and no one else may: an
 /// absolute, non-symlink, regular file, owned by *us* (we run the signer), and
 /// mode 0600-or-stricter — no group/world access at all. Stricter than
@@ -912,6 +974,20 @@ fn stage_trusted_template(src: &Path, dst: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reject_path_separator_flags_only_colon_bearing_dirs() {
+        // A colon-free dir is accepted; the error names the offending var and
+        // mentions PATH so the operator can see why startup refused it.
+        assert!(
+            reject_path_separator(Path::new("/nix/store/abc/bin"), "NIX_BIN directory").is_ok()
+        );
+        let err = reject_path_separator(Path::new("/opt/a:b"), "WARM_TOOLS_DIR")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("WARM_TOOLS_DIR"), "unexpected error: {err}");
+        assert!(err.contains("PATH"), "unexpected error: {err}");
+    }
 
     #[test]
     fn read_private_file_rejects_symlinks() {
