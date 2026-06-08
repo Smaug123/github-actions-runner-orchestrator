@@ -23,7 +23,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tracing::{error, info, warn};
 use zeroize::Zeroizing;
@@ -57,6 +57,19 @@ pub async fn run(rt: Runtime) -> Result<()> {
     } = rt;
     let spool = Arc::new(Spool::new(config.spool_dir.clone()));
     let permits = Arc::new(Semaphore::new(config.max_concurrency));
+
+    // Optional signing-cache warmer, built only when CACHE_WARM_ENABLED. Its
+    // paths/flags were already validated at startup (`validate_cache_warm`), so a
+    // construction failure here is a genuine misconfiguration (e.g. an unreadable
+    // cache pubkey) and should fail startup rather than silently never warm.
+    let warmer = if config.cache_warm_enabled {
+        Some(Arc::new(
+            crate::warm::Warmer::new(Arc::clone(&gh), Arc::clone(&allowed_repos), &config)
+                .context("build cache warmer")?,
+        ))
+    } else {
+        None
+    };
 
     // Pause gate: while true the dispatch loop stops claiming new jobs (they
     // wait in new/); in-flight jobs and the GC keep running. Flipped by the
@@ -227,6 +240,13 @@ pub async fn run(rt: Runtime) -> Result<()> {
                     job_id = event.workflow_job.id,
                     "claiming job"
                 );
+                // Best-effort signing-cache warm when this job is the live tip of
+                // its repo's default branch. Cheap + fire-and-forget: it spawns
+                // its own task and never blocks the dispatch loop or affects the
+                // job. `&event` is borrowed before `spawn_job` consumes it below.
+                if let Some(warmer) = &warmer {
+                    warmer.maybe_trigger(&event);
+                }
                 spawn_job(
                     Arc::clone(&spool),
                     Arc::clone(&config),

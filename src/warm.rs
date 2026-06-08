@@ -12,9 +12,9 @@
 //! is the live default-branch tip — and the hardened build+sign (`run_warm`):
 //! an untrusted private flake is ingested under a scrubbed env, a private
 //! nix.conf, a full-closure aarch64-linux check, and IFD disabled, then the
-//! signed closure is copied into the Mac cache. The module is not yet wired into
-//! the dispatch loop; that is a later slice.
-#![allow(dead_code)] // wired into the supervisor in a later slice
+//! signed closure is copied into the Mac cache. `supervisor::run` builds one
+//! `Warmer` when `CACHE_WARM_ENABLED` and calls `maybe_trigger` from its
+//! `Prepared::Run` arm for every job it claims.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
