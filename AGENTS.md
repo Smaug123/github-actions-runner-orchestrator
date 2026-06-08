@@ -56,6 +56,9 @@ src/supervisor.rs  — dispatch loop; prepare() is the validation choke point
 src/runner.rs      — per-job state machine; vm_name(repo, job_id)
 src/gc.rs          — sweep (stale cur/, orphan VMs, offline runners) +
                      reconcile (mint for still-queued jobs lacking a runner)
+src/warm.rs        — signing-cache warmer (3c, opt-in): on a default-branch tip,
+                     drives warm-{cache,flake-inputs}.sh to sign the closure into
+                     the Mac cache; build offloads to the trusted linux-builder
 src/control.rs     — optional loopback HTTP control endpoint (pause/resume/status)
 src/lima/mod.rs    — limactl wrapper; instance struct, timeouts, kill_on_drop
 src/github/        — App JWT, installation tokens (account-scoped), JIT mint
@@ -110,6 +113,19 @@ src/github/        — App JWT, installation tokens (account-scoped), JIT mint
    `cur/` record (`write_synthetic_claim`), so they are GC-backed,
    teardown-eligible, and stale-expiring exactly like webhook-minted
    jobs — keep it that way rather than tracking them in memory.
+10. **The warmer never signs guest-produced bytes.** `src/warm.rs`
+    ingests an *untrusted* private flake and emits *trusted signed*
+    bytes, so it builds on the **trusted `linux-builder`** (via the
+    nix-daemon), never inside an ephemeral `gha-*` job VM, and never
+    harvests/signs a guest's output. The untrusted-flake → signed-bytes
+    crossing is held by the hardening in `run_warm` — scrubbed env,
+    pinned trusted `PATH`, a private `nix.conf` (`require-sigs`, pinned
+    substituters/keys, `accept-flake-config = false`,
+    `allow-import-from-derivation = false`), a full-closure
+    `aarch64-linux` check before building, and a down-scoped
+    `contents:read` token on a `0600` netrc. Don't weaken any of these,
+    and keep `maybe_trigger` best-effort/fire-and-forget so a warm can
+    never block or fail the job that triggered it.
 
 ## Wire contract with the spool
 

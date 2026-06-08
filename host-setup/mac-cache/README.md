@@ -37,15 +37,17 @@ domain"). Segmenting per-repo is deferred (`DEFERRED.md`).
 - **3b (guest config, in `nix/guest.nix`):** the guest's `nix.settings` appends
   this cache + its public key via `extra-substituters` /
   `extra-trusted-public-keys`, keeping `cache.nixos.org` and its key.
+- **3c (consumer code, `src/warm.rs`):** the automatic host warmer. When a
+  `workflow_job` the consumer runs is the live tip of its repo's default branch,
+  it drives `warm-flake-inputs.sh` + `warm-cache.sh` to sign that flake's closure
+  into this cache automatically (see "Automatic warming"). Off by default
+  (`CACHE_WARM_ENABLED`); manual warming below still works regardless.
 
 Still to come:
 
 - **Prune** (a `warm-cache.sh` follow-up): delete stale NARs behind the host
   lock, gated on a GC-truth precondition (no `gha-*` Lima VMs + empty spool) and
   a delete-vs-live-fetch grace window. Deliberately not in this slice.
-
-The automatic host warmer (3c) is deferred — v1 is populated manually by running
-`warm-cache.sh` yourself, with `cache.nixos.org` as fallback.
 
 ## One-time setup
 
@@ -239,6 +241,51 @@ a `flake.lock`), and **re-warm after a `flake.lock` bump** (warming is keyed by
 the pinned `narHash`). There is **no `aarch64-linux` assertion** here — an input
 `-source` tree is system-agnostic (the exact content the lock pins), so warming
 from this `aarch64-darwin` host is correct.
+
+## Automatic warming
+
+The consumer (`src/warm.rs`, gated behind `CACHE_WARM_ENABLED`) automates the two
+manual steps above. When a `workflow_job` it runs is the **live tip of its repo's
+default branch**, it fires a best-effort, fire-and-forget warm: it runs
+`warm-flake-inputs.sh <flakeref>` then, per hardcoded target
+(`devShells.aarch64-linux.default`, `packages.aarch64-linux.default`), a hardened
+`nix build` followed by `warm-cache.sh <flakeref>#<target>`. It *drives* these
+scripts (reusing their signing, host lock, manifest, and full-closure copy); it
+does not reimplement them. Failure anywhere is logged at debug and never touches
+the job that triggered it.
+
+**It builds on the host, offloaded to the `linux-builder`** — the Mac is
+`aarch64-darwin` and can't build `aarch64-linux` natively, so the nix-daemon
+dispatches the compile to the trusted `linux-builder` VM. This *is* a VM build,
+but it preserves the threat-model invariant **"never trust/sign guest-produced
+bytes":** the `linux-builder` is trusted infrastructure, distinct from the
+untrusted ephemeral `gha-*` job VMs. Building untrusted flake code inside a
+throwaway job VM and then signing the result on the host would invert that
+invariant and is rejected.
+
+The warmer ingests an **untrusted private flake** and emits **trusted signed
+bytes**, so every child nix runs hardened (full detail in `src/warm.rs` and
+`CACHE_WARMER_PLAN.md`):
+
+- a **scrubbed env** + a pinned `PATH` of trusted dirs only, and a **private
+  `nix.conf`** pinning `require-sigs = true`, the substituters/trusted-keys, plus
+  `accept-flake-config = false`, empty `flake-registry`, and
+  `allow-import-from-derivation = false` — so a malicious `flake.nix` can't
+  substitute-and-re-sign attacker-prebuilt outputs or run host-side build code
+  during evaluation;
+- a **full-closure system check** (`nix derivation show --recursive`): the build
+  runs only if every derivation in the closure is `aarch64-linux` (or a `builtin`
+  fetcher), so a smuggled `aarch64-darwin` *input* derivation can't build on the
+  Mac;
+- a **down-scoped `contents:read` token** for just that repo, on a `0600` netrc
+  (never the URL/argv), unlinked after the run; and
+- a per-child **timeout + process-group kill**, with concurrency capped and a
+  coalescer collapsing the burst of events one push emits.
+
+Enable it with `CACHE_WARM_ENABLED=true` plus `NIX_BIN`, `WARM_CACHE_BASE` (this
+`GHA_CACHE_DIR`), `MAC_CACHE_DIR` (this scripts dir), `WARM_TOOLS_DIR` (holds
+`jq`), and the substituter/pubkey pins. Requires the `linux-builder` running and
+the App granted repo **Contents: Read**.
 
 ## Layout
 
