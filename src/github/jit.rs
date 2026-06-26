@@ -342,6 +342,49 @@ impl GhClient {
         Ok(out)
     }
 
+    /// Status of a single registered runner by id. `Ok(None)` on 404 — the
+    /// runner is unknown to GitHub: an ephemeral runner whose JIT registration
+    /// was reaped after its job went to a peer (or was cancelled) shows up this
+    /// way, as does one not yet created. The dispatch watchdog uses this to tell
+    /// a runner that is working (`busy`) or merely waiting (`online`, idle) from
+    /// one whose registration is gone (offline or 404). Repo-scoped; uses the
+    /// same self-hosted-runners read scope as `list_runners`/`delete_runner`.
+    pub async fn runner_status(
+        &self,
+        owner: &str,
+        repo: &str,
+        runner_id: u64,
+    ) -> Result<Option<Runner>> {
+        let tok = self.token().await?;
+        let url = format!(
+            "{}/repos/{}/{}/actions/runners/{}",
+            self.api, owner, repo, runner_id
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&tok)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .send()
+            .await
+            .context("GET runner")?;
+        if resp.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            anyhow::bail!(
+                "runner_status {}/{} {}: {} {}",
+                owner,
+                repo,
+                runner_id,
+                resp.status(),
+                resp.text().await.unwrap_or_default()
+            );
+        }
+        Ok(Some(resp.json().await?))
+    }
+
     pub async fn delete_runner(&self, owner: &str, repo: &str, runner_id: u64) -> Result<()> {
         let tok = self.token().await?;
         let url = format!(

@@ -21,7 +21,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use tokio::fs;
@@ -72,7 +72,7 @@ pub async fn run_job(
         .await
         .context("mint JIT runner config")?;
 
-    let inner = run_in_vm(&job, &vm_name, &config, &lima, &jit).await;
+    let inner = run_in_vm(&job, &vm_name, &config, gh.as_ref(), &lima, &jit, owner, repo).await;
     // Capture the guest serial console BEFORE teardown deletes the VM (and its
     // serialv.log with it). Runs regardless of `inner`: an in-guest build OOM
     // kills the build but the runner agent still exits 0, so the job finalizes
@@ -188,12 +188,16 @@ async fn write_serial_evidence(path: &std::path::Path, contents: &[u8]) -> Resul
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_in_vm(
     job: &Job,
     vm_name: &str,
     config: &Config,
+    gh: &GhClient,
     lima: &Lima,
     jit: &JitConfigResp,
+    owner: &str,
+    repo: &str,
 ) -> Result<()> {
     let jit_host_path = jit_path(config, vm_name);
     write_jit_blob(&jit_host_path, jit.encoded_jit_config.as_bytes())
@@ -208,10 +212,33 @@ async fn run_in_vm(
         .context("copy JIT blob into VM")?;
 
     let deadline = Duration::from_secs(config.job_max_runtime_secs);
-    let exit = lima
-        .shell(vm_name, &["sudo", "gha-run-once", "/tmp/jit"], deadline)
-        .await
-        .context("run gha-run-once")?;
+    let run = lima.shell(vm_name, &["sudo", "gha-run-once", "/tmp/jit"], deadline);
+    // Race the runner against the dispatch watchdog. The watchdog only ever
+    // resolves to abort a runner that never picked up a job; on a normal run it
+    // loops forever and `run` wins. `biased` polls `run` first so a job that
+    // just finished is never pre-empted by a watchdog tick that came due in the
+    // same wakeup. Returning Err here (either path) lets the caller's teardown
+    // stop+delete the VM — which is exactly how we kill a wedged runner whose
+    // `gha-run-once` would otherwise never return.
+    let exit = if config.dispatch_deadline_secs == 0 {
+        run.await.context("run gha-run-once")?
+    } else {
+        tokio::select! {
+            biased;
+            res = run => res.context("run gha-run-once")?,
+            reason = watch_dispatch(
+                gh,
+                owner,
+                repo,
+                jit.runner.id,
+                vm_name,
+                Duration::from_secs(config.dispatch_deadline_secs),
+                Duration::from_secs(config.dispatch_poll_secs),
+            ) => {
+                anyhow::bail!("dispatch watchdog aborted runner: {reason}");
+            }
+        }
+    };
     if !exit.success() {
         // repo.full_name and workflow_job.name are author-controlled even
         // though they're HMAC-signed; sanitize before splicing into the
@@ -226,6 +253,120 @@ async fn run_in_vm(
         );
     }
     Ok(())
+}
+
+/// One poll observation of the minted runner's state on GitHub.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RunnerObs {
+    /// Online and executing a job (`busy = true`). The runner is doing real
+    /// work; the watchdog stands down permanently once this is seen.
+    Busy,
+    /// Online but idle (`busy = false`) — registered and waiting for a job.
+    /// Healthy for the first few seconds; wedged if it persists past the
+    /// deadline (the job it was minted for went to a peer or was cancelled).
+    Idle,
+    /// Offline, or absent from GitHub entirely (404). The ephemeral
+    /// registration is gone — the runner agent is looping on
+    /// `Registration … was not found` and will never exit on its own.
+    Gone,
+    /// The status poll itself failed (API/network error). Carries no signal:
+    /// we neither abort on it nor let it reset progress toward the deadline.
+    Unknown,
+}
+
+/// What the watchdog should do given the latest observation. Pure and
+/// unit-tested; `watch_dispatch` is the thin polling loop around it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DispatchVerdict {
+    Continue,
+    Abort(&'static str),
+}
+
+/// Decide, from one observation, whether a runner that has **not yet run a job**
+/// is wedged. `Busy` is handled by the caller (it parks permanently the moment a
+/// job starts, so this is only ever reached pre-dispatch), but is mapped to
+/// `Continue` here too so the function is total and safe to call in any state.
+///
+/// `Unknown` (a failed poll) is inert — it never aborts, so a flaky GitHub API
+/// can't reap a healthy runner; the next good poll decides. `deadline` doubles
+/// as the boot/registration grace: a runner is legitimately `Gone` (offline /
+/// not-yet-created) for the seconds between VM start and the agent connecting,
+/// far inside a multi-minute deadline.
+fn dispatch_verdict(obs: RunnerObs, elapsed: Duration, deadline: Duration) -> DispatchVerdict {
+    match obs {
+        // Working, or a poll we couldn't read: never wedged on this tick.
+        RunnerObs::Busy | RunnerObs::Unknown => DispatchVerdict::Continue,
+        // Registered-but-idle or registration-gone: wedged only once it has
+        // outlived the deadline (which doubles as the boot/registration grace).
+        RunnerObs::Idle | RunnerObs::Gone if elapsed <= deadline => DispatchVerdict::Continue,
+        RunnerObs::Gone => {
+            DispatchVerdict::Abort("registration lost before the runner ran any job")
+        }
+        RunnerObs::Idle => {
+            DispatchVerdict::Abort("runner stayed idle without ever picking up a job")
+        }
+    }
+}
+
+/// Map a single `runner_status` call to a poll observation. A failed call is
+/// `Unknown`, not `Gone`: a transient API blip must not be read as a lost
+/// registration.
+async fn observe_runner(gh: &GhClient, owner: &str, repo: &str, runner_id: u64) -> RunnerObs {
+    match gh.runner_status(owner, repo, runner_id).await {
+        Ok(Some(r)) if r.busy => RunnerObs::Busy,
+        Ok(Some(r)) if r.status == "online" => RunnerObs::Idle,
+        Ok(Some(_)) => RunnerObs::Gone, // registered but offline
+        Ok(None) => RunnerObs::Gone,    // 404: deregistered / never created
+        Err(e) => {
+            warn!(runner_id, error = %format!("{e:#}"), "dispatch watchdog: runner status poll failed; ignoring this tick");
+            RunnerObs::Unknown
+        }
+    }
+}
+
+/// Poll the minted runner until it is wedged, returning a human-readable reason.
+///
+/// Resolves **only** when `dispatch_verdict` says to abort; on a healthy run it
+/// never returns, so the `select!` in `run_in_vm` is decided by `gha-run-once`
+/// exiting instead. The returned reason is spliced into the job's error and
+/// drives the caller's teardown, which stops+deletes the VM (killing the wedged
+/// runner) and deregisters it; the reconciler re-mints only if the job is still
+/// queued on GitHub (a cancelled/stolen one is not, so there is no churn).
+async fn watch_dispatch(
+    gh: &GhClient,
+    owner: &str,
+    repo: &str,
+    runner_id: u64,
+    vm: &str,
+    deadline: Duration,
+    poll: Duration,
+) -> String {
+    let start = Instant::now();
+    let mut ticker = tokio::time::interval(poll);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    ticker.tick().await; // the first tick fires immediately; nothing to observe yet
+    loop {
+        ticker.tick().await;
+        let obs = observe_runner(gh, owner, repo, runner_id).await;
+        if obs == RunnerObs::Busy {
+            // The runner picked up a job: it can never be wedged now, and the
+            // 6h JOB_MAX_RUNTIME_SECS ceiling takes over. Park forever (no more
+            // polling) so the select! in run_in_vm is resolved only by
+            // gha-run-once exiting.
+            std::future::pending::<()>().await;
+        }
+        let elapsed = start.elapsed();
+        if let DispatchVerdict::Abort(reason) = dispatch_verdict(obs, elapsed, deadline) {
+            warn!(
+                vm,
+                runner_id,
+                elapsed_secs = elapsed.as_secs(),
+                observation = ?obs,
+                "dispatch watchdog: runner never started a job; reaping its VM ({reason})"
+            );
+            return reason.to_string();
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -448,5 +589,70 @@ mod tests {
         assert!(split_full_name("Octocat-Org/repo.name_with-dashes").is_ok());
         assert!(split_full_name("a/b").is_ok());
         assert!(split_full_name("digits-1/two_2.dot").is_ok());
+    }
+
+    #[test]
+    fn dispatch_verdict_busy_never_aborts() {
+        // A busy runner is doing real work; never reap it, even long past the
+        // dispatch deadline. (In the loop this state parks permanently.)
+        let d = Duration::from_secs(300);
+        assert_eq!(
+            dispatch_verdict(RunnerObs::Busy, Duration::from_secs(10_000), d),
+            DispatchVerdict::Continue
+        );
+    }
+
+    #[test]
+    fn dispatch_verdict_idle_within_deadline_waits() {
+        let d = Duration::from_secs(300);
+        assert_eq!(
+            dispatch_verdict(RunnerObs::Idle, Duration::from_secs(120), d),
+            DispatchVerdict::Continue
+        );
+        // The boundary (exactly at the deadline) is still within grace.
+        assert_eq!(
+            dispatch_verdict(RunnerObs::Idle, d, d),
+            DispatchVerdict::Continue
+        );
+    }
+
+    #[test]
+    fn dispatch_verdict_idle_past_deadline_aborts() {
+        let d = Duration::from_secs(300);
+        assert!(matches!(
+            dispatch_verdict(RunnerObs::Idle, Duration::from_secs(301), d),
+            DispatchVerdict::Abort(_)
+        ));
+    }
+
+    #[test]
+    fn dispatch_verdict_gone_within_deadline_is_boot_grace() {
+        // A runner is legitimately offline/absent in the boot+register window;
+        // the deadline doubles as that grace, so don't abort early.
+        let d = Duration::from_secs(300);
+        assert_eq!(
+            dispatch_verdict(RunnerObs::Gone, Duration::from_secs(20), d),
+            DispatchVerdict::Continue
+        );
+    }
+
+    #[test]
+    fn dispatch_verdict_gone_past_deadline_aborts() {
+        let d = Duration::from_secs(300);
+        assert!(matches!(
+            dispatch_verdict(RunnerObs::Gone, Duration::from_secs(301), d),
+            DispatchVerdict::Abort(_)
+        ));
+    }
+
+    #[test]
+    fn dispatch_verdict_unknown_is_inert() {
+        // A failed poll never aborts, even past the deadline — a flaky GitHub
+        // API must not reap a healthy runner; the next good poll decides.
+        let d = Duration::from_secs(300);
+        assert_eq!(
+            dispatch_verdict(RunnerObs::Unknown, Duration::from_secs(10_000), d),
+            DispatchVerdict::Continue
+        );
     }
 }

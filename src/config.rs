@@ -99,6 +99,27 @@ pub struct Config {
     #[arg(long, env = "JOB_MAX_RUNTIME_SECS", default_value_t = 6 * 60 * 60)]
     pub job_max_runtime_secs: u64,
 
+    /// Ceiling on the *dispatch* phase: how long a freshly-minted runner may go
+    /// without GitHub ever marking it `busy` (i.e. without picking up a job)
+    /// before we treat it as wedged and tear its VM down. GitHub's label
+    /// matching is fungible and a job can be cancelled/superseded after we mint,
+    /// so a runner can register and then wait forever for a job that was handed
+    /// to a peer or cancelled — the actions/runner agent treats the resulting
+    /// `Registration … was not found` as retriable and never exits, so
+    /// `gha-run-once` never returns and the VM pins a concurrency slot until the
+    /// ~6h JOB_MAX_RUNTIME_SECS ceiling. A healthy runner goes busy within
+    /// seconds, so a few minutes is generous. Once a runner is observed busy the
+    /// watchdog stands down for the rest of the job (then JOB_MAX_RUNTIME_SECS
+    /// governs), so only never-ran-a-job runners are reaped. 0 disables the
+    /// watchdog.
+    #[arg(long, env = "DISPATCH_DEADLINE_SECS", default_value_t = 5 * 60)]
+    pub dispatch_deadline_secs: u64,
+
+    /// Poll cadence for the dispatch watchdog's per-runner GitHub status checks.
+    /// Only consulted when DISPATCH_DEADLINE_SECS != 0.
+    #[arg(long, env = "DISPATCH_POLL_SECS", default_value_t = 20)]
+    pub dispatch_poll_secs: u64,
+
     /// Seconds to retain finalized spool entries (done/ + error/) before the GC
     /// sweep prunes them. 0 disables pruning (keeps the archive forever).
     /// Default 2 days.
@@ -475,6 +496,12 @@ impl Config {
         }
         if self.job_max_runtime_secs == 0 {
             anyhow::bail!("JOB_MAX_RUNTIME_SECS must be >= 1");
+        }
+        // The dispatch watchdog (when enabled) polls on a tokio interval, which
+        // panics on a 0s period. The deadline itself may be 0 — that is the
+        // documented "disable the watchdog" value — but the poll period can't.
+        if self.dispatch_poll_secs == 0 {
+            anyhow::bail!("DISPATCH_POLL_SECS must be >= 1");
         }
         if self.api_timeout_secs == 0 {
             anyhow::bail!("GH_API_TIMEOUT_SECS must be >= 1");
