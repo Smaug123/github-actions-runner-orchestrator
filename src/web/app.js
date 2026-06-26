@@ -158,7 +158,14 @@ function jobRow(job) {
   if (job.vm) {
     const vm = document.createElement("div");
     vm.className = "mono muted sub-line";
-    vm.textContent = job.vm;
+    // The VM name is the token operators copy most, so make it an atomic
+    // selection unit (CSS .vm-name { user-select: all }): one click grabs the
+    // whole `gha-…` id, and a drag can no longer bleed up into the linked
+    // Actions id stacked above it in this same cell.
+    const name = document.createElement("span");
+    name.className = "vm-name";
+    name.textContent = job.vm;
+    vm.appendChild(name);
     const st = vmStatusLabel(job);
     if (st) {
       const badge = document.createElement("span");

@@ -79,6 +79,9 @@
     .subtle { color: var(--muted); font-size: 12px; padding: 8px 12px 0; }
     .vm-status.ok { color: var(--green); }
     .vm-status.warn { color: var(--amber); }
+    /* Select the gha-… VM name as one atomic token: a single click copies the
+       whole id, and a leftward drag can't spill into the Actions id above it. */
+    .vm-name { -webkit-user-select: all; user-select: all; }
     .job-link { color: var(--accent); text-decoration: none; }
     .job-link:hover { text-decoration: underline; }
 
