@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Template for the user LaunchAgent that keeps darwin.linux-builder running.
+     install-launchd.sh renders the __PLACEHOLDERS__ (it copies this to
+     ~/Library/LaunchAgents/<label>.plist). It is a LaunchAgent (per-user GUI
+     session), NOT a root LaunchDaemon, because qemu's HVF acceleration needs
+     the logged-in GUI session; the builder runs only while that user is
+     logged in. -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>__LABEL__</string>
+
+  <!-- Wrapper sets the stable TMPDIR + pinned-qemu invariants. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>__WRAPPER__</string>
+  </array>
+
+  <!-- Start at login and keep the VM up; relaunch if qemu ever exits. -->
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <!-- Avoid a tight respawn loop if a start fails (e.g. port still held). -->
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+
+  <!-- run-builder / run-nixos-vm call everything (nix-store, qemu, mkfs.erofs,
+       ...) by absolute store path, so a minimal PATH is sufficient.
+       GHA_BUILDER_HOME pins $BASE so the wrapper resolves the same dir at
+       launchd runtime as it did at install time — launchd does NOT inherit the
+       installer's one-shot shell env, so without this a GHA_BUILDER_HOME=...
+       install would silently fall back to the default ~/.local/share path. -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/nix/var/nix/profiles/default/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>GHA_BUILDER_HOME</key>
+    <string>__BASE__</string>
+  </dict>
+
+  <!-- Both stdout and stderr to the builder log. -->
+  <key>StandardOutPath</key>
+  <string>__BASE__/builder.log</string>
+  <key>StandardErrorPath</key>
+  <string>__BASE__/builder.log</string>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>

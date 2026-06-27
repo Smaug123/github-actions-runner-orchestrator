@@ -46,10 +46,55 @@ not nix-darwin, so the wiring is installed by hand here rather than generated.
 
 The host key is the well-known public nix-darwin builder key — not a secret.
 
+These keep the builder running across logins (installed by `install-launchd.sh`,
+which is separate from `install.sh` above — that one wires the daemon, this one
+supervises the VM):
+
+- `start-builder.sh` → `$BASE/start-builder.sh`: the launcher the agent runs. It
+  enforces two invariants the bare `nix run nixpkgs#darwin.linux-builder` flow
+  lacks (read its header for the full why): a **stable `TMPDIR`** off `/tmp` (or
+  macOS reaps the VM's 9p CA-cert share on a multi-day VM and TLS to
+  cache.nixos.org breaks with curl error 77), and a **pinned qemu** via a gcroot
+  (the registry nixpkgs can drift to a qemu that aborts on Apple-Silicon HVF:
+  `hvf_arch_init_vcpu ... Abort trap: 6`).
+- `launchd-agent.plist` → `~/Library/LaunchAgents/<label>.plist`: `RunAtLoad` +
+  `KeepAlive` LaunchAgent template (placeholders rendered at install).
+
 ## Persistence
 
-The builder VM only runs while the `nix run` terminal is open. A launchd plist
-to keep it running across reboots is a planned follow-up.
+A user **LaunchAgent** keeps the builder running across logins. All builder
+runtime state lives in one self-contained dir, `$BASE` (default
+`~/.local/share/gha-linux-builder`, override with `GHA_BUILDER_HOME`):
+
+    nixos.qcow2          persistent builder store (mutable; never in the repo)
+    keys/                guest host keypair (private key; never in the repo)
+    run-builder-gcroot   gcroot pinning a known-good run-builder closure
+    run/                 ephemeral TMPDIR (regenerated each start)
+    start-builder.sh     the launcher (installed copy of the repo template)
+    builder.log          stdout+stderr
+
+One-time install (after the builder has booted once so `nixos.qcow2`/`keys/`
+exist):
+
+    # pin the working run-builder so GC and `nix run` drift can't remove/replace it
+    nix-store --realise <run-builder-store-path> --indirect \
+      --add-root "$HOME/.local/share/gha-linux-builder/run-builder-gcroot"
+    ./install-launchd.sh        # run as your login user, NOT sudo
+
+It's a **LaunchAgent, not a root LaunchDaemon**: qemu's HVF acceleration needs
+the logged-in GUI session, so the builder runs only while you're logged in (a
+headless daemon would need root + HVF-entitlement handling). Never run a manual
+`nix run` builder alongside it — both bind host port 31022.
+
+Manage it (uid shown by `id -u`):
+
+    launchctl print     gui/$(id -u)/<label>   # state
+    launchctl kickstart -k gui/$(id -u)/<label>   # restart
+    launchctl bootout   gui/$(id -u)/<label>   # stop
+    tail -f "$HOME/.local/share/gha-linux-builder/builder.log"
+
+To intentionally upgrade the builder later, repoint the gcroot at a new
+run-builder and `launchctl kickstart -k` the agent.
 
 ## Troubleshooting
 
