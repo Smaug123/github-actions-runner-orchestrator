@@ -83,7 +83,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
 use crate::github::event::{Repository, WorkflowJob, WorkflowJobInfo};
-use crate::github::jit::{GhClient, JobStatus};
+use crate::github::jit::{GhClient, JobStatus, Runner};
 use crate::lima::Lima;
 use crate::runner::vm_name;
 use crate::spool::{
@@ -144,7 +144,15 @@ pub async fn sweep(config: &Config, gh: &GhClient, lima: &Lima) {
 /// finalize here.
 pub async fn reap_all_managed_vms_at_startup(config: &Config, lima: &Lima) {
     let cur_dir = config.spool_dir.join("cur");
-    let live_map = live_vm_map_from_cur(&cur_dir).await.unwrap_or_default();
+    // The reap below deletes EVERY managed VM by name shape regardless of the
+    // claim set, so an unreadable cur/ must not stop it — it only costs us the
+    // claim map used to finalize claims to error/. Surface the read failure
+    // (don't swallow it): the affected claims are backstopped by the 6h
+    // stale-claim expiry rather than finalized here.
+    let live_map = live_vm_map_from_cur(&cur_dir).await.unwrap_or_else(|e| {
+        warn!(error = %e, "startup reap: cannot read cur/ to map claims; VMs still reaped, unfinalized claims left for the 6h expiry");
+        HashMap::new()
+    });
     let spool = Spool::new(config.spool_dir.clone());
 
     let instances = match lima.list_instances().await {
@@ -228,6 +236,103 @@ async fn delete_with_retry(lima: &Lima, name: &str) -> anyhow::Result<()> {
     Err(last_err.expect("loop runs at least once, so an Err was recorded on failure"))
 }
 
+/// A managed Lima VM as the sweep sees it: its name and, for a VM that still
+/// holds a live claim, the guest image it booted (read from
+/// `<instance>/lima.yaml`). `image` is `None` for an orphan (we never read it —
+/// the VM is deleted regardless of image) or when the instance's lima.yaml
+/// can't be read/parsed (the stale-image check then skips it, fail-safe).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManagedVm {
+    name: String,
+    image: Option<ImageIdentity>,
+}
+
+/// A destructive VM action the sweep decided on, kept as data so the *decision*
+/// (`plan_vm_reaps`) is a pure function of its inputs, separable from the
+/// limactl/spool *effects* that carry it out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum VmReap {
+    /// Managed VM with no live claim. Stop + delete; there is no claim to
+    /// finalize (an orphan is by definition unbacked).
+    Orphan { name: String },
+    /// Live-claimed VM booted from a superseded image. Stop + delete, and only
+    /// on a *successful* delete finalize `cur_path` to error/ so the
+    /// runner-orphan pass removes the now-offline runner this same sweep.
+    /// `vm_location` is carried for the log/finalize reason.
+    StaleImage {
+        name: String,
+        cur_path: PathBuf,
+        vm_location: String,
+    },
+}
+
+/// Decide which managed VMs to reap this sweep, purely.
+///
+/// `live` is `None` when cur/ could not be read this tick. On that uncertainty
+/// we must reap NOTHING: a transient unreadable cur/ mistaken for "no live
+/// claims" would orphan (and delete) every managed VM and fail their in-flight
+/// jobs. Every other branch fails safe on uncertainty too — a VM we can't
+/// positively classify as stale (no current image, unreadable/unparsable booted
+/// image) is left alone.
+fn plan_vm_reaps(
+    managed: &[ManagedVm],
+    live: Option<&HashMap<String, PathBuf>>,
+    current: Option<&ImageIdentity>,
+) -> Vec<VmReap> {
+    // Unknown live set (unreadable cur/) -> reap nothing. This is THE guard that
+    // stops a transient FS error from deleting every managed VM.
+    let Some(live) = live else {
+        return Vec::new();
+    };
+    let mut plan = Vec::new();
+    for vm in managed {
+        match live.get(&vm.name) {
+            // No live claim -> classic orphan.
+            None => plan.push(VmReap::Orphan {
+                name: vm.name.clone(),
+            }),
+            // Live claim: reap only if positively classified as stale-image.
+            Some(cur_path) => {
+                if let (Some(current), Some(image)) = (current, vm.image.as_ref()) {
+                    if is_stale_image(image, current) {
+                        plan.push(VmReap::StaleImage {
+                            name: vm.name.clone(),
+                            cur_path: cur_path.clone(),
+                            vm_location: image.location.clone(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    plan
+}
+
+/// Decide which GH runners to delete as orphans, purely. `live` is the claim
+/// set AFTER this sweep's VM reaps (a reaped stale VM has dropped out so its
+/// now-offline runner is deleted here). `None` -> delete nothing, for the same
+/// reason as `plan_vm_reaps`: uncertainty must not delete live runners.
+///
+/// A runner is an orphan iff it has our exact managed name shape, no live claim
+/// backs it, and it can't currently be doing useful work — offline, or online
+/// but idle. A busy run-once runner is left alone: it's executing a (possibly
+/// stolen) job and exits on its own afterward.
+fn plan_runner_reaps<'a>(runners: &'a [Runner], live: Option<&HashSet<String>>) -> Vec<&'a Runner> {
+    // Unknown live set (unreadable cur/) -> delete nothing, same reason as
+    // plan_vm_reaps.
+    let Some(live) = live else {
+        return Vec::new();
+    };
+    runners
+        .iter()
+        .filter(|r| {
+            is_managed_vm_name(&r.name)
+                && !live.contains(&r.name)
+                && (r.status == "offline" || !r.busy)
+        })
+        .collect()
+}
+
 async fn sweep_inner(config: &Config, gh: &GhClient, lima: &Lima) -> anyhow::Result<()> {
     let cur_dir = config.spool_dir.join("cur");
 
@@ -260,15 +365,19 @@ async fn sweep_inner(config: &Config, gh: &GhClient, lima: &Lima) -> anyhow::Res
     )
     .await;
 
-    // vm_name -> cur/ path for every live claim. The orphan branch consults
-    // the key set; the stale-image branch needs the path so it can finalize a
-    // reaped VM's claim to error/.
-    let live_map = live_vm_map_from_cur(&cur_dir).await.unwrap_or_default();
-    // Mutable: the stale-image reap below removes each VM it destroys so the
-    // runner-cleanup loop treats the now-offline runner as unbacked and deletes
-    // it in this same sweep (otherwise GitHub could hand the dead runner queued
-    // work for a whole extra sweep).
-    let mut live: HashSet<String> = live_map.keys().cloned().collect();
+    // vm_name -> cur/ path for every live claim, or `None` when cur/ could not
+    // be read this tick. Every reap decision below treats `None` as "unknown —
+    // reap nothing": a transient unreadable cur/ must never be mistaken for an
+    // empty live set, which would delete every managed VM and every idle runner
+    // and fail their in-flight jobs. (The rest of this sweep likewise fails safe
+    // on uncertainty.)
+    let live_map: Option<HashMap<String, PathBuf>> = match live_vm_map_from_cur(&cur_dir).await {
+        Ok(m) => Some(m),
+        Err(e) => {
+            warn!(error = %e, "gc: cannot read cur/ live claim set; reaping nothing this tick");
+            None
+        }
+    };
 
     // The image the consumer's current LIMA_TEMPLATE boots. None when we can't
     // read/parse the staged template; in that case we skip stale-image reaping
@@ -277,41 +386,63 @@ async fn sweep_inner(config: &Config, gh: &GhClient, lima: &Lima) -> anyhow::Res
 
     let spool = Spool::new(config.spool_dir.clone());
 
-    match lima.list_instances().await {
+    // Enumerate managed VMs. For a VM that still holds a live claim, read the
+    // image it booted so plan_vm_reaps can classify it as stale-or-not; orphans
+    // (no live claim, incl. every VM when live_map is None) skip the read since
+    // they're deleted regardless of image.
+    let managed: Vec<ManagedVm> = match lima.list_instances().await {
         Ok(instances) => {
+            let mut managed = Vec::new();
             for (name, dir) in instances {
                 if !is_managed_vm_name(&name) {
                     continue;
                 }
-                // 1. No live claim at all -> classic orphan; stop + delete.
-                if !live.contains(&name) {
-                    info!(vm = %name, "gc: orphan Lima VM, deleting");
-                    if let Err(e) = lima.stop(&name).await {
-                        warn!(vm = %name, error = %e, "stop");
+                let image = if live_map.as_ref().is_some_and(|m| m.contains_key(&name)) {
+                    let img = vm_booted_image(dir.as_deref()).await;
+                    if img.is_none() {
+                        warn!(vm = %name, "gc: cannot determine booted image; skipping stale-image check");
                     }
-                    if let Err(e) = lima.delete(&name).await {
-                        warn!(vm = %name, error = %e, "delete");
-                    }
-                    continue;
-                }
-                // 2. Claimed and live, but possibly booted from a superseded
-                //    image. Reap iff we can positively classify it as stale;
-                //    skip on any uncertainty (no current image, unreadable
-                //    lima.yaml, unparsable location).
-                let Some(current) = current_image.as_ref() else {
-                    continue;
+                    img
+                } else {
+                    None
                 };
-                let Some(vm_image) = vm_booted_image(dir.as_deref()).await else {
-                    warn!(vm = %name, "gc: cannot determine booted image; skipping stale-image check");
-                    continue;
-                };
-                if !is_stale_image(&vm_image, current) {
-                    continue;
+                managed.push(ManagedVm { name, image });
+            }
+            managed
+        }
+        Err(e) => {
+            warn!(error = %e, "gc: limactl list failed");
+            Vec::new()
+        }
+    };
+
+    // Execute the VM reap plan. Track the stale VMs we actually destroyed so the
+    // runner pass sees their now-offline runners as unbacked in THIS sweep.
+    let mut reaped_stale: HashSet<String> = HashSet::new();
+    for reap in plan_vm_reaps(&managed, live_map.as_ref(), current_image.as_ref()) {
+        match reap {
+            VmReap::Orphan { name } => {
+                info!(vm = %name, "gc: orphan Lima VM, deleting");
+                if let Err(e) = lima.stop(&name).await {
+                    warn!(vm = %name, error = %e, "stop");
                 }
+                if let Err(e) = lima.delete(&name).await {
+                    warn!(vm = %name, error = %e, "delete");
+                }
+            }
+            VmReap::StaleImage {
+                name,
+                cur_path,
+                vm_location,
+            } => {
+                let current_location = current_image
+                    .as_ref()
+                    .map(|c| sanitize_for_log(&c.location))
+                    .unwrap_or_default();
                 info!(
                     vm = %name,
-                    image = %sanitize_for_log(&vm_image.location),
-                    current = %sanitize_for_log(&current.location),
+                    image = %sanitize_for_log(&vm_location),
+                    current = %current_location,
                     "gc: reaping stale-image VM (still claimed) and finalizing its claim to error/"
                 );
                 if let Err(e) = lima.stop(&name).await {
@@ -320,8 +451,8 @@ async fn sweep_inner(config: &Config, gh: &GhClient, lima: &Lima) -> anyhow::Res
                 // Only tear down the claim/live state once the VM is *actually*
                 // gone. A failed delete (limactl error/timeout) means the VM —
                 // and its still-online, possibly-busy runner — may still be up.
-                // Archiving the claim and dropping it from `live` here would make
-                // the runner-orphan branch below treat that live runner as
+                // Finalizing the claim and dropping it from the live set here
+                // would make the runner-orphan pass treat that live runner as
                 // unbacked and delete it. So on delete failure we leave both the
                 // cur/ claim and the live entry intact and let the next sweep
                 // retry the reap.
@@ -329,29 +460,35 @@ async fn sweep_inner(config: &Config, gh: &GhClient, lima: &Lima) -> anyhow::Res
                     warn!(vm = %sanitize_for_log(&name), error = %e, "gc: delete failed for stale-image VM; leaving claim and live entry for next sweep");
                     continue;
                 }
-                // Finalize the live claim to error/ so the runner-orphan
-                // branch below deletes the now-offline GitHub runner (and so
-                // expire_stale_cur won't keep aging a claim for a VM we just
-                // destroyed).
-                if let Some(cur_path) = live_map.get(&name) {
-                    let reason = format!(
-                        "gc: reaped stale-image VM ({} != {})",
-                        sanitize_for_log(&vm_image.location),
-                        sanitize_for_log(&current.location)
-                    );
-                    if let Err(e) = spool.finalize_error(cur_path, &reason).await {
-                        warn!(vm = %name, error = %e, "gc: finalize_error for reaped stale-image VM");
-                    }
+                // Finalize the live claim to error/ so the runner-orphan pass
+                // deletes the now-offline GitHub runner (and so expire_stale_cur
+                // won't keep aging a claim for a VM we just destroyed).
+                let reason = format!(
+                    "gc: reaped stale-image VM ({} != {})",
+                    sanitize_for_log(&vm_location),
+                    current_location
+                );
+                if let Err(e) = spool.finalize_error(&cur_path, &reason).await {
+                    warn!(vm = %name, error = %e, "gc: finalize_error for reaped stale-image VM");
                 }
-                // Drop this VM from the live set: the claim is no longer in cur/
-                // and the VM is gone, so the runner-cleanup loop below must see
-                // the runner as unbacked and delete it in THIS sweep — before
-                // GitHub can assign the dead runner freshly-queued work.
-                live.remove(&name);
+                // Mark this VM reaped so the runner pass drops it from the
+                // effective live set: the claim is gone and the VM is destroyed,
+                // so its runner must be deleted THIS sweep — before GitHub can
+                // hand the dead runner freshly-queued work.
+                reaped_stale.insert(name);
             }
         }
-        Err(e) => warn!(error = %e, "gc: limactl list failed"),
     }
+
+    // The live set the runner pass consults: the original claims minus the stale
+    // VMs we just destroyed. `None` (unreadable cur/) stays `None` -> delete no
+    // runners. Orphans were never in the live set, so they need no adjustment.
+    let live_after_reap: Option<HashSet<String>> = live_map.as_ref().map(|m| {
+        m.keys()
+            .filter(|k| !reaped_stale.contains(*k))
+            .cloned()
+            .collect()
+    });
 
     for repo_full in &config.allowed_repos {
         let Some((owner, repo)) = repo_full.split_once('/') else {
@@ -360,26 +497,16 @@ async fn sweep_inner(config: &Config, gh: &GhClient, lima: &Lima) -> anyhow::Res
         };
         match gh.list_runners(owner, repo, VM_NAME_PREFIX).await {
             Ok(runners) => {
-                for r in runners {
-                    // Restrict deletion to the exact shape this factory mints.
-                    // The repo may host runners from other tooling that happens
-                    // to share the gha- prefix; we must never delete those.
-                    if !is_managed_vm_name(&r.name) {
-                        continue;
-                    }
-                    let backed_by_vm = live.contains(&r.name);
-                    let dead = r.status == "offline" || !r.busy;
-                    if !backed_by_vm && dead {
-                        info!(
-                            runner = %r.name,
-                            repo = %repo_full,
-                            status = %r.status,
-                            busy = r.busy,
-                            "gc: removing orphan runner"
-                        );
-                        if let Err(e) = gh.delete_runner(owner, repo, r.id).await {
-                            warn!(runner = %r.name, error = %e, "delete runner");
-                        }
+                for r in plan_runner_reaps(&runners, live_after_reap.as_ref()) {
+                    info!(
+                        runner = %r.name,
+                        repo = %repo_full,
+                        status = %r.status,
+                        busy = r.busy,
+                        "gc: removing orphan runner"
+                    );
+                    if let Err(e) = gh.delete_runner(owner, repo, r.id).await {
+                        warn!(runner = %r.name, error = %e, "delete runner");
                     }
                 }
             }
@@ -438,7 +565,11 @@ async fn reconcile_inner(
     paused: &tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let cur_dir = config.spool_dir.join("cur");
-    let live = live_vm_names_from_cur(&cur_dir).await.unwrap_or_default();
+    // An unreadable cur/ means we can't tell which queued jobs are already
+    // claimed. Skip this mint pass rather than reconcile against a bogus-empty
+    // live set (which would attempt a redundant mint per queued job); the next
+    // tick retries once cur/ is readable again.
+    let live = live_vm_names_from_cur(&cur_dir).await?;
 
     for repo_full in &config.allowed_repos {
         // Re-check pause before each repo's network I/O. The control endpoint
@@ -852,20 +983,32 @@ async fn live_vm_names_from_cur(cur_dir: &Path) -> anyhow::Result<HashSet<String
 /// (reconcile) that only need membership.
 async fn live_vm_map_from_cur(cur_dir: &Path) -> anyhow::Result<HashMap<String, PathBuf>> {
     let mut out = HashMap::new();
+    // read_dir / next_entry failures stay HARD errors: a truncated enumeration
+    // could UNDER-report live claims, and a missing claim is exactly what makes
+    // the sweep delete a live VM/runner. Callers treat this Err as "reap
+    // nothing this tick" rather than as an empty live set.
     let mut rd = tokio::fs::read_dir(cur_dir).await?;
     while let Some(ent) = rd.next_entry().await? {
-        let Ok(ft) = ent.file_type().await else {
+        // The filename alone identifies the claim and its vm_name (the
+        // supervisor validated the filename<->id match before the file entered
+        // cur/), so a name that doesn't parse as `<id>.job` is simply not a
+        // claim -> skip it, no stat needed.
+        let name = ent.file_name();
+        let Some(id) = name.to_str().and_then(parse_spool_filename) else {
             continue;
         };
-        if !ft.is_file() {
-            continue;
+        // file_type is only a best-effort filter for a stray non-file that
+        // happens to be named like a claim (never happens in a healthy spool).
+        // Skip ONLY entries we can positively confirm are non-regular; on a stat
+        // error KEEP the claim — dropping one we can't stat would make the sweep
+        // treat its live VM/runner as an orphan and delete it (fail-safe: an
+        // unreadable-but-claim-named entry stays live).
+        if let Ok(ft) = ent.file_type().await {
+            if !ft.is_file() {
+                continue;
+            }
         }
-        let Some(s) = ent.file_name().to_str().map(str::to_string) else {
-            continue;
-        };
-        if let Some(id) = parse_spool_filename(&s) {
-            out.insert(vm_name(id), ent.path());
-        }
+        out.insert(vm_name(id), ent.path());
     }
     Ok(out)
 }
@@ -1201,6 +1344,205 @@ mod tests {
             location: location.to_string(),
             digest: digest.map(str::to_string),
         }
+    }
+
+    fn mk_runner(id: u64, name: String, status: &str, busy: bool) -> Runner {
+        Runner {
+            id,
+            name,
+            status: status.to_string(),
+            busy,
+        }
+    }
+
+    // ---- plan_vm_reaps (pure reap decision) ----
+
+    #[test]
+    fn plan_vm_reaps_none_live_reaps_nothing() {
+        // The catastrophic regression: an unreadable cur/ (live = None) must reap
+        // NOTHING, even with managed VMs present. Treating None as an empty live
+        // set (the old unwrap_or_default bug) would orphan every VM here.
+        let managed = vec![
+            ManagedVm {
+                name: vm_name(1),
+                image: Some(id("/img/a.raw", None)),
+            },
+            ManagedVm {
+                name: vm_name(2),
+                image: None,
+            },
+        ];
+        let current = id("/img/current.raw", None);
+        assert!(
+            plan_vm_reaps(&managed, None, Some(&current)).is_empty(),
+            "None (unreadable cur/) must reap no VMs"
+        );
+    }
+
+    #[test]
+    fn plan_vm_reaps_orphans_vms_without_a_live_claim() {
+        // A PRESENT-but-empty live set is the genuine "no claims" case: every
+        // managed VM is an orphan. This is the behaviour None must NOT share.
+        let live: HashMap<String, PathBuf> = HashMap::new();
+        let managed = vec![ManagedVm {
+            name: vm_name(1),
+            image: None,
+        }];
+        assert_eq!(
+            plan_vm_reaps(&managed, Some(&live), None),
+            vec![VmReap::Orphan { name: vm_name(1) }]
+        );
+    }
+
+    #[test]
+    fn plan_vm_reaps_keeps_live_current_image_vm() {
+        let path = PathBuf::from("/spool/cur/1.job");
+        let live: HashMap<String, PathBuf> = [(vm_name(1), path)].into_iter().collect();
+        let current = id("/img/current.raw", None);
+        // Same image as current -> not stale -> kept.
+        let managed = vec![ManagedVm {
+            name: vm_name(1),
+            image: Some(current.clone()),
+        }];
+        assert!(plan_vm_reaps(&managed, Some(&live), Some(&current)).is_empty());
+    }
+
+    #[test]
+    fn plan_vm_reaps_reaps_live_but_stale_image_vm() {
+        let path = PathBuf::from("/spool/cur/1.job");
+        let live: HashMap<String, PathBuf> = [(vm_name(1), path.clone())].into_iter().collect();
+        let current = id("/img/new.raw", None);
+        let managed = vec![ManagedVm {
+            name: vm_name(1),
+            image: Some(id("/img/old.raw", None)),
+        }];
+        assert_eq!(
+            plan_vm_reaps(&managed, Some(&live), Some(&current)),
+            vec![VmReap::StaleImage {
+                name: vm_name(1),
+                cur_path: path,
+                vm_location: "/img/old.raw".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn plan_vm_reaps_keeps_claimed_vm_on_image_uncertainty() {
+        let path = PathBuf::from("/spool/cur/1.job");
+        let live: HashMap<String, PathBuf> = [(vm_name(1), path)].into_iter().collect();
+        // Unreadable/unparsable booted image (None) -> never reaped.
+        let managed = vec![ManagedVm {
+            name: vm_name(1),
+            image: None,
+        }];
+        let current = id("/img/new.raw", None);
+        assert!(
+            plan_vm_reaps(&managed, Some(&live), Some(&current)).is_empty(),
+            "a claimed VM whose booted image we can't read is left alone"
+        );
+        // No current image to compare against -> never reaped either.
+        let managed = vec![ManagedVm {
+            name: vm_name(1),
+            image: Some(id("/img/old.raw", None)),
+        }];
+        assert!(
+            plan_vm_reaps(&managed, Some(&live), None).is_empty(),
+            "with no current image there is nothing to call stale against"
+        );
+    }
+
+    // ---- plan_runner_reaps (pure reap decision) ----
+
+    #[test]
+    fn plan_runner_reaps_none_live_reaps_nothing() {
+        // Runner side of the catastrophic regression: unreadable cur/ (None)
+        // must delete no runners, even idle unbacked ones.
+        let runners = vec![mk_runner(1, vm_name(1), "offline", false)];
+        assert!(
+            plan_runner_reaps(&runners, None).is_empty(),
+            "None (unreadable cur/) must delete no runners"
+        );
+    }
+
+    #[test]
+    fn plan_runner_reaps_deletes_unbacked_idle_or_offline() {
+        let live: HashSet<String> = HashSet::new();
+        let runners = vec![
+            mk_runner(1, vm_name(1), "offline", false),
+            mk_runner(2, vm_name(2), "online", false),
+        ];
+        let reaped: Vec<u64> = plan_runner_reaps(&runners, Some(&live))
+            .iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(
+            reaped,
+            vec![1, 2],
+            "offline and idle-online are both orphans"
+        );
+    }
+
+    #[test]
+    fn plan_runner_reaps_keeps_backed_runner() {
+        let live: HashSet<String> = [vm_name(1)].into_iter().collect();
+        let runners = vec![mk_runner(1, vm_name(1), "offline", false)];
+        assert!(
+            plan_runner_reaps(&runners, Some(&live)).is_empty(),
+            "a live-backed runner is never deleted"
+        );
+    }
+
+    #[test]
+    fn plan_runner_reaps_keeps_busy_online_runner() {
+        let live: HashSet<String> = HashSet::new();
+        // Unbacked but online+busy: executing a (possibly stolen) job; leave it.
+        let runners = vec![mk_runner(1, vm_name(1), "online", true)];
+        assert!(plan_runner_reaps(&runners, Some(&live)).is_empty());
+    }
+
+    #[test]
+    fn plan_runner_reaps_ignores_unmanaged_names() {
+        let live: HashSet<String> = HashSet::new();
+        // Not our exact name shape -> never touched, even unbacked and idle.
+        let runners = vec![mk_runner(1, "gha-runner-1".to_string(), "offline", false)];
+        assert!(plan_runner_reaps(&runners, Some(&live)).is_empty());
+    }
+
+    // ---- live_vm_map_from_cur (filesystem-backed) ----
+
+    #[tokio::test]
+    async fn live_vm_map_from_cur_maps_job_files_and_skips_non_claims() {
+        let dir = tempfile::tempdir().unwrap();
+        let cur = dir.path().join("cur");
+        tokio::fs::create_dir_all(&cur).await.unwrap();
+        tokio::fs::write(cur.join("10.job"), b"x").await.unwrap();
+        tokio::fs::write(cur.join("256.job"), b"x").await.unwrap();
+        // Non-claim entries are ignored, not errors: wrong suffix, non-numeric
+        // stem, and a subdir whose name DOES parse as a claim (filtered by the
+        // is_file() check, not the name).
+        tokio::fs::write(cur.join("notes.txt"), b"x").await.unwrap();
+        tokio::fs::write(cur.join("bad.job"), b"x").await.unwrap();
+        tokio::fs::create_dir_all(cur.join("999.job"))
+            .await
+            .unwrap();
+
+        let map = live_vm_map_from_cur(&cur).await.unwrap();
+        let mut names: Vec<String> = map.keys().cloned().collect();
+        names.sort();
+        let mut want = vec![vm_name(10), vm_name(256)];
+        want.sort();
+        assert_eq!(names, want, "only regular `<id>.job` files are claims");
+        assert_eq!(map.get(&vm_name(10)), Some(&cur.join("10.job")));
+    }
+
+    #[tokio::test]
+    async fn live_vm_map_from_cur_errs_on_unreadable_dir() {
+        // The invariant sweep_inner's fail-safe relies on: an unreadable cur/
+        // surfaces as Err, NEVER as an empty (Ok) map. sweep_inner turns that Err
+        // into "reap nothing this tick" rather than "no live claims".
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        assert!(live_vm_map_from_cur(&missing).await.is_err());
     }
 
     #[test]
