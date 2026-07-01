@@ -72,7 +72,17 @@ pub async fn run_job(
         .await
         .context("mint JIT runner config")?;
 
-    let inner = run_in_vm(&job, &vm_name, &config, gh.as_ref(), &lima, &jit, owner, repo).await;
+    let inner = run_in_vm(
+        &job,
+        &vm_name,
+        &config,
+        gh.as_ref(),
+        &lima,
+        &jit,
+        owner,
+        repo,
+    )
+    .await;
     // Capture the guest serial console BEFORE teardown deletes the VM (and its
     // serialv.log with it). Runs regardless of `inner`: an in-guest build OOM
     // kills the build but the runner agent still exits 0, so the job finalizes
