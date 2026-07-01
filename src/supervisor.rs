@@ -23,8 +23,9 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
+use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 use zeroize::Zeroizing;
 
@@ -112,13 +113,15 @@ pub async fn run(rt: Runtime) -> Result<()> {
 
     crate::gc::sweep(&config, &gh, &lima).await;
 
+    // The watcher owns the only Sender for `tx`. watch() loops forever in
+    // normal operation, so the dispatch loop below can exit via rx.recv()
+    // returning None ONLY when this task ends, i.e. only on failure. Keep the
+    // task's Result (don't swallow it) so describe_watcher_exit can surface the
+    // cause and fail the daemon loud instead of exiting 0.
     let (tx, mut rx) = mpsc::channel::<String>(256);
     let watch_root = spool.new_dir();
-    let watcher = tokio::spawn(async move {
-        if let Err(e) = crate::spool::watch(watch_root, tx).await {
-            error!(error = %e, "spool watcher exited");
-        }
-    });
+    let watcher: JoinHandle<Result<()>> =
+        tokio::spawn(async move { crate::spool::watch(watch_root, tx).await });
 
     {
         let config = Arc::clone(&config);
@@ -175,7 +178,7 @@ pub async fn run(rt: Runtime) -> Result<()> {
         });
     }
 
-    'dispatch: while let Some(name) = rx.recv().await {
+    while let Some(name) = rx.recv().await {
         // Acquire a permit while honoring pause. Two rules:
         //
         //  - Acquire the permit BEFORE claiming. The cur/ directory is ground
@@ -197,8 +200,12 @@ pub async fn run(rt: Runtime) -> Result<()> {
             let permit = match Arc::clone(&permits).acquire_owned().await {
                 Ok(p) => p,
                 Err(_) => {
+                    // The semaphore is owned within this scope and never closed
+                    // in normal operation; if it is, the dispatch loop can't do
+                    // its job. Fail loud rather than falling through to a clean
+                    // exit (or hanging on the still-live watcher below).
                     error!("semaphore closed; bailing out of dispatch");
-                    break 'dispatch;
+                    return Err(anyhow!("dispatch semaphore closed unexpectedly"));
                 }
             };
             if *pause_rx.borrow() {
@@ -273,8 +280,28 @@ pub async fn run(rt: Runtime) -> Result<()> {
         }
     }
 
-    let _ = watcher.await;
-    Ok(())
+    // Reaching here means rx.recv() returned None: the watcher dropped the
+    // only Sender, which under normal operation never happens (watch() loops
+    // forever). So the watcher has already terminated abnormally. Surface its
+    // cause rather than returning Ok(()) — a clean exit here would return 0
+    // from main while the runtime teardown SIGKILLs every in-flight limactl
+    // shell without finalize.
+    Err(describe_watcher_exit(watcher).await)
+}
+
+/// Translate a terminated spool-watcher task into the error the dispatch loop
+/// should fail with. Called only after the dispatch channel closed, so the
+/// task has already finished and awaiting it can't block.
+async fn describe_watcher_exit(watcher: JoinHandle<Result<()>>) -> anyhow::Error {
+    let err = match watcher.await {
+        // watch() returned Ok — only possible if its internal event channel
+        // closed under it. Still abnormal: the dispatcher has no source of work.
+        Ok(Ok(())) => anyhow!("spool watcher exited without error but its channel closed"),
+        Ok(Err(e)) => e.context("spool watcher failed"),
+        Err(e) => anyhow::Error::new(e).context("spool watcher task panicked"),
+    };
+    error!(error = %format!("{err:#}"), "dispatch loop lost its spool watcher; failing");
+    err
 }
 
 enum Prepared {
@@ -1025,6 +1052,43 @@ mod tests {
         assert_eq!(completion_action(Some("completed")), CompletionAction::Done);
         // 404 / unknown: fail safe toward Done.
         assert_eq!(completion_action(None), CompletionAction::Done);
+    }
+
+    #[tokio::test]
+    async fn watcher_exit_ok_is_still_an_error() {
+        // watch() returning Ok means its event channel closed under it; the
+        // dispatch loop only reaches describe_watcher_exit on an abnormal
+        // termination, so even Ok must become an error (never exit 0).
+        let h: JoinHandle<Result<()>> = tokio::spawn(async { Ok(()) });
+        let e = describe_watcher_exit(h).await;
+        assert!(
+            e.to_string().contains("channel closed"),
+            "unexpected error: {e:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn watcher_exit_err_propagates_cause() {
+        let h: JoinHandle<Result<()>> = tokio::spawn(async { Err(anyhow!("enumerate boom")) });
+        let e = describe_watcher_exit(h).await;
+        let chain = format!("{e:#}");
+        assert!(chain.contains("spool watcher failed"), "chain: {chain}");
+        assert!(chain.contains("enumerate boom"), "chain: {chain}");
+    }
+
+    #[tokio::test]
+    async fn watcher_panic_becomes_error() {
+        let h: JoinHandle<Result<()>> = tokio::spawn(async {
+            if true {
+                panic!("watcher boom");
+            }
+            Ok(())
+        });
+        let e = describe_watcher_exit(h).await;
+        assert!(
+            e.to_string().contains("panicked"),
+            "unexpected error: {e:#}"
+        );
     }
 
     impl std::fmt::Debug for Prepared {
