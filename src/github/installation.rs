@@ -180,6 +180,21 @@ impl Installations {
         Ok(body.token)
     }
 
+    /// Forget the cached installation token **iff it still equals `stale`**.
+    ///
+    /// A caller that got a 401 while authenticating with `stale` asks us to
+    /// drop it so the next `token()` re-mints. The equality guard makes this
+    /// safe under concurrency: if several callers hold the same stale token and
+    /// all 401 at once, only the first clears the cache; the rest (and any peer
+    /// that already re-minted) find a different token and leave it untouched,
+    /// so we never clobber a freshly-minted token with `None`.
+    pub async fn invalidate(&self, stale: &str) {
+        let mut cache = self.token.lock().await;
+        if cache.as_ref().is_some_and(|c| c.token == stale) {
+            *cache = None;
+        }
+    }
+
     /// Mint a fresh installation token **down-scoped** to `repository_ids` with
     /// only `permissions`, bypassing the shared cache entirely.
     ///
@@ -257,6 +272,43 @@ mod tests {
             valid_until: t + Duration::from_secs(3 * 60),
         };
         assert!(!tok.is_fresh_at(t));
+    }
+
+    // An `Installations` whose credentials are never exercised — enough to
+    // drive the pure cache-invalidation path, which never mints.
+    fn installations() -> Installations {
+        let auth = AppAuth {
+            app_id: 1,
+            pem: Arc::new(Zeroizing::new(Vec::new())),
+        };
+        Installations::new("http://unused".to_string(), Client::new(), auth)
+    }
+
+    #[tokio::test]
+    async fn invalidate_clears_only_the_matching_token() {
+        let inst = installations();
+        {
+            let mut cache = inst.token.lock().await;
+            *cache = Some(CachedToken {
+                token: "a".into(),
+                valid_until: base() + TOKEN_TTL,
+            });
+        }
+        // A 401 reported against a *different* token must not clobber the cache
+        // — a peer may have re-minted "a" -> "b" in the meantime.
+        inst.invalidate("b").await;
+        assert!(inst.token.lock().await.is_some());
+        // A 401 against the token actually held clears it, so the next token()
+        // re-mints.
+        inst.invalidate("a").await;
+        assert!(inst.token.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn invalidate_on_empty_cache_is_a_noop() {
+        let inst = installations();
+        inst.invalidate("anything").await;
+        assert!(inst.token.lock().await.is_none());
     }
 
     #[test]

@@ -29,12 +29,11 @@ pub fn mint(app_id: u64, pem: &[u8]) -> Result<String> {
     encode(&Header::new(Algorithm::RS256), &claims, &key).context("sign JWT")
 }
 
+// Throwaway 2048-bit RSA key, generated solely for tests. Not a secret. Lives
+// at module scope (not inside `mod tests`) so other modules' tests can mint a
+// JWT against a fake GitHub API — e.g. jit.rs's 401-retry tests.
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    // Throwaway 2048-bit RSA key, generated solely for this test. Not a secret.
-    const TEST_PEM: &[u8] = b"-----BEGIN RSA PRIVATE KEY-----
+pub(crate) const TEST_PEM: &[u8] = b"-----BEGIN RSA PRIVATE KEY-----
 MIIEpQIBAAKCAQEAyDpILWhAraEt1ApjZ8u2BC8DTopCxOGdB6PHpnJOHncXWf37
 3C7WS4Y/C6p/vjf0/rneUntZm2Q3E3vXvYE85RMfggwx1VqkSKlZxol2lSM41EOu
 EJeekpkiwALUtTlmWXOCCP+eMijOUIGhX9ashL+E5Ob4TTVtxBCjWwHlIf1J+J3u
@@ -61,6 +60,10 @@ J8SfXe0CgYEAoX/uaGwpK/fIhRAuKjCY4NV0pwXHFM8ZalBup/HoSLxy7jsbf/MQ
 BdWHdpSA+S47kwrCCY0vhHmqa2VhyZpcnw8H57oseRBcyC6f77wFR+cCZf04qpOD
 8kveANLE4n9wssXtUMiWVOXwzk6T8dHlLpTmfEoJtQKeZC74aUh8mcI=
 -----END RSA PRIVATE KEY-----";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
 
     // Regression guard: jsonwebtoken 10.x resolves its crypto provider lazily
     // and panics on the first sign if neither rust_crypto nor aws_lc_rs is
