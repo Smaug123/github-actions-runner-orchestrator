@@ -18,7 +18,7 @@
 // token fetch behind one roundtrip.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 use reqwest::Client;
@@ -69,9 +69,30 @@ pub struct Installations {
     token: Mutex<Option<CachedToken>>,
 }
 
+/// How long we hold a minted installation token before refreshing. GitHub
+/// gives us 60 minutes; we refresh 10 early to keep the window tight.
+const TOKEN_TTL: Duration = Duration::from_secs(50 * 60);
+
+/// Don't serve a cached token with less than this much life left, so an
+/// in-flight request can't outlive the token it was authorized with.
+const REFRESH_MARGIN: Duration = Duration::from_secs(5 * 60);
+
 struct CachedToken {
     token: String,
-    valid_until: Instant,
+    // Wall-clock, not monotonic: the token's expiry is wall-clock (60 minutes
+    // after mint), and a monotonic `Instant` freezes while the host sleeps, so
+    // a monotonic TTL would keep serving a token GitHub had already expired.
+    // `SystemTime` advances across sleep, matching app_jwt.rs's expiry maths.
+    valid_until: SystemTime,
+}
+
+impl CachedToken {
+    /// Fresh enough to serve iff more than `REFRESH_MARGIN` of wall-clock life
+    /// remains at `now`. Pure so the margin arithmetic is unit-testable without
+    /// a real clock.
+    fn is_fresh_at(&self, now: SystemTime) -> bool {
+        self.valid_until > now + REFRESH_MARGIN
+    }
 }
 
 impl Installations {
@@ -120,7 +141,7 @@ impl Installations {
         {
             let cache = self.token.lock().await;
             if let Some(cached) = cache.as_ref() {
-                if cached.valid_until > Instant::now() + Duration::from_secs(5 * 60) {
+                if cached.is_fresh_at(SystemTime::now()) {
                     return Ok(cached.token.clone());
                 }
             }
@@ -150,7 +171,7 @@ impl Installations {
         let body: TokenResp = resp.json().await?;
         let cached = CachedToken {
             token: body.token.clone(),
-            valid_until: Instant::now() + Duration::from_secs(50 * 60),
+            valid_until: SystemTime::now() + TOKEN_TTL,
         };
         {
             let mut cache = self.token.lock().await;
@@ -209,6 +230,51 @@ impl Installations {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A fixed wall-clock instant to anchor the freshness maths, well clear of
+    // the epoch so we can subtract without underflow.
+    fn base() -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)
+    }
+
+    #[test]
+    fn fresh_when_full_ttl_remaining() {
+        let t = base();
+        let tok = CachedToken {
+            token: "x".into(),
+            valid_until: t + TOKEN_TTL,
+        };
+        // Just minted: comfortably more than REFRESH_MARGIN left.
+        assert!(tok.is_fresh_at(t));
+    }
+
+    #[test]
+    fn stale_within_refresh_margin() {
+        let t = base();
+        let tok = CachedToken {
+            token: "x".into(),
+            // Only 3 minutes left — inside the 5-minute margin, so refresh.
+            valid_until: t + Duration::from_secs(3 * 60),
+        };
+        assert!(!tok.is_fresh_at(t));
+    }
+
+    #[test]
+    fn stale_after_wall_clock_advances_past_expiry() {
+        // Regression for the sleep-freeze bug: a token minted at T is
+        // valid_until T+50min. If the host sleeps and wakes at T+55min of wall
+        // time, the token must read as stale. The bug measured this window with
+        // a monotonic clock that doesn't advance during sleep, so it kept
+        // serving a token GitHub had already expired. Measuring `now` in
+        // wall-clock time rejects it.
+        let mint = base();
+        let tok = CachedToken {
+            token: "x".into(),
+            valid_until: mint + TOKEN_TTL,
+        };
+        let woke = mint + Duration::from_secs(55 * 60);
+        assert!(!tok.is_fresh_at(woke));
+    }
 
     #[test]
     fn scoped_token_body_shape() {
