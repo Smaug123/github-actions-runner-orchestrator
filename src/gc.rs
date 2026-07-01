@@ -454,6 +454,24 @@ fn plan_runner_reaps<'a>(runners: &'a [Runner], live: Option<&HashSet<String>>) 
 /// file (a successful finalize already removed it, so the subtraction only bites
 /// on that rare failure). An unreadable cur/ yields a `None` live set → reap
 /// nothing, the same fail-safe every other reap decision uses on uncertainty.
+///
+/// Accepted trade-off (deliberately NOT reading before `list_runners`): because
+/// the read is after the list, a claim written in the gap can back a runner that
+/// was already in the response — e.g. a job re-minted (deterministic name reused)
+/// after the list, whose fresh claim makes an already-listed same-named leftover
+/// look backed, so we skip deleting it. This is benign and bounded, unlike the
+/// symmetric VM case (which is destructive and so reads cur/ *before* its list):
+/// the runner pass only DEFERS a deletion — it never finalizes a claim or deletes
+/// a VM — an offline leftover cannot pick up work so lingering one sweep is
+/// harmless, an online+idle leftover is either legitimately serving that job
+/// (deterministic name) or suppresses reconcile's re-mint via `should_mint`'s
+/// idle coverage, and a re-mint that collides on the name 409s and finalizes its
+/// claim to error/ within ~a second, so the backing is transient and the next
+/// sweep deletes the leftover. Reading *before* the list would instead make the
+/// fresh-mint guarantee depend on `list_runners` latency staying below
+/// registration lag; if the API stalls, a fresh mint's runner could appear in a
+/// slow response with its claim not-yet-read and be deleted — reintroducing the
+/// destructive "Registration not found" bug. We keep the airtight side.
 async fn plan_runner_reaps_from_cur<'a>(
     cur_dir: &Path,
     runners: &'a [Runner],
