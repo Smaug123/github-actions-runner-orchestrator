@@ -126,30 +126,36 @@ pub async fn sweep(config: &Config, gh: &GhClient, lima: &Lima) {
     }
 }
 
-/// Startup reap: stop + delete EVERY pre-existing managed (`gha-<16hex>`) VM
-/// and finalize each one's cur/ claim to error/.
+/// Startup reap: stop + delete EVERY pre-existing managed (`gha-<16hex>`) VM,
+/// then finalize EVERY pre-existing cur/ claim to error/ — including claims that
+/// never had a VM.
 ///
-/// A freshly-started consumer cannot re-adopt an in-flight job's `limactl
-/// shell` session (the supervisor that owned it is gone), so every
-/// pre-existing claim is unmanageable: the VM would linger until
+/// A freshly-started consumer cannot re-adopt an in-flight job's `limactl shell`
+/// session (the supervisor that owned it is gone), so every pre-existing claim
+/// is unmanageable regardless of whether a VM exists: a VM would linger until
 /// JOB_MAX_RUNTIME_SECS while its still-online runner steals freshly-queued
-/// jobs. This is safe under the documented pause -> drain -> restart
-/// procedure: after a clean drain there are no managed VMs, so this is a
-/// no-op; after a crash it cleans up the wreckage.
+/// jobs, and a claim whose VM was never created — a crash between `try_claim`
+/// and `limactl start` — would suppress the reconciler's re-mint (its cur/ file
+/// makes `should_mint` return false) until the 6h stale-claim expiry. Finalizing
+/// all of them to error/ lets the reconciler re-mint any still-queued job within
+/// a tick. The one exception is a claim whose VM delete FAILED: that VM (and its
+/// runner) may still be up, so its claim is left for the 6h expiry rather than
+/// finalized here. This is safe under the documented pause -> drain -> restart
+/// procedure: after a clean drain there are no managed VMs and no live claims,
+/// so this is a no-op; after a crash it cleans up the wreckage.
 ///
 /// MUST run before the supervisor begins claiming/launching jobs, so it can
 /// never reap a VM the new consumer just started (it deletes by `gha-<16hex>`
-/// shape, and a just-launched job would match). The runner-orphan branch of
-/// the periodic sweep deletes the now-offline GitHub runners whose claims we
-/// finalize here.
+/// shape, and a just-launched job would match) or finalize a claim it just
+/// wrote. The runner-orphan branch of the periodic sweep deletes the now-offline
+/// GitHub runners whose claims we finalize here.
 pub async fn reap_all_managed_vms_at_startup(config: &Config, lima: &Lima) {
     let cur_dir = config.spool_dir.join("cur");
-    // The reap below deletes EVERY managed VM by name shape regardless of the
-    // claim set, so an unreadable cur/ must not stop it — it only costs us the
-    // claim map used to finalize claims to error/. Surface the read failure
-    // (don't swallow it): the affected claims are backstopped by the 6h
+    // We finalize every reapable claim below, so an unreadable cur/ only costs us
+    // the claim map — VMs are still reaped by name shape. Surface the read
+    // failure (don't swallow it): the affected claims are backstopped by the 6h
     // stale-claim expiry rather than finalized here.
-    let live_map = live_vm_map_from_cur(&cur_dir).await.unwrap_or_else(|e| {
+    let claims = live_vm_map_from_cur(&cur_dir).await.unwrap_or_else(|e| {
         warn!(error = %e, "startup reap: cannot read cur/ to map claims; VMs still reaped, unfinalized claims left for the 6h expiry");
         HashMap::new()
     });
@@ -162,46 +168,59 @@ pub async fn reap_all_managed_vms_at_startup(config: &Config, lima: &Lima) {
             return;
         }
     };
+
+    // Stop + delete every managed VM. Record which managed VM names limactl
+    // listed (`present`) and which we FAILED to delete (`delete_failed`) so the
+    // pure planner below can decide each claim's fate. Finalizing is deferred to
+    // one pass after the delete loop rather than done inline: a claim's fate
+    // depends on whether *its* VM survived, and a VM-less claim (crash between
+    // `try_claim` and `limactl start`) has no instance to key off here at all.
+    let mut present: HashSet<String> = HashSet::new();
+    let mut delete_failed: HashSet<String> = HashSet::new();
     for (name, _dir) in instances {
         if !is_managed_vm_name(&name) {
             continue;
         }
+        present.insert(name.clone());
         info!(vm = %name, "startup: reaping pre-existing managed VM (fresh consumer cannot re-adopt)");
         if let Err(e) = lima.stop(&name).await {
             warn!(vm = %name, error = %e, "startup reap: stop");
         }
-        // Only archive the claim once the VM is *actually* gone. A failed delete
-        // (limactl error/timeout, VM still present) means the VM — and its
-        // possibly-live runner — may still be up, so we must NOT finalize its
-        // cur/ claim to error/: doing so would make the runner-orphan branch
-        // treat a live runner as unbacked.
+        // `delete` returns Ok iff the VM is *actually* gone. A failure (limactl
+        // error/timeout, VM still present) means the VM — and its possibly-live
+        // runner — may still be up, so we must NOT finalize its cur/ claim to
+        // error/: doing so would make the runner-orphan branch treat a live
+        // runner as unbacked.
         //
-        // Unlike the stale-image SWEEP path (which re-runs every
-        // GC_INTERVAL_SECS and naturally re-attempts a still-present VM), this
-        // startup reap is one-shot. Worse, a pre-existing orphan booted from the
-        // CURRENT image that we fail to delete here would never be re-reaped by
-        // the periodic sweep — it's current-image with a live cur/ claim, so it
-        // looks like a healthy in-flight job — and would linger until the 6h
-        // JOB_MAX_RUNTIME_SECS stale-claim expiry. So give the delete a bounded
-        // retry with a short fixed backoff before giving up.
+        // Unlike the stale-image SWEEP path (which re-runs every GC_INTERVAL_SECS
+        // and naturally re-attempts a still-present VM), this startup reap is
+        // one-shot. Worse, a pre-existing orphan booted from the CURRENT image
+        // that we fail to delete here would never be re-reaped by the periodic
+        // sweep — it's current-image with a live cur/ claim, so it looks like a
+        // healthy in-flight job — and would linger until the 6h stale-claim
+        // expiry. So give the delete a bounded retry with a short fixed backoff
+        // before giving up and recording it as delete_failed.
         if let Err(e) = delete_with_retry(lima, &name).await {
             error!(
                 vm = %sanitize_for_log(&name),
                 error = %e,
                 "startup reap: delete failed after retries; leaving cur/ claim intact (will only be cleaned by the 6h stale-claim expiry)"
             );
-            continue;
+            delete_failed.insert(name);
         }
-        if let Some(cur_path) = live_map.get(&name) {
-            if let Err(e) = spool
-                .finalize_error(
-                    cur_path,
-                    "startup: reaped orphan VM (fresh consumer cannot re-adopt)",
-                )
-                .await
-            {
-                warn!(vm = %name, error = %e, "startup reap: finalize_error");
-            }
+    }
+
+    // Finalize every reapable claim to error/ so the reconciler re-mints any
+    // still-queued job within a tick. This covers both claims whose VM we just
+    // deleted AND claims that never had a VM (the crash window between try_claim
+    // and `limactl start`), which were previously stranded until the 6h expiry.
+    // Claims whose VM delete failed are excluded (see delete_failed above).
+    for fin in plan_startup_claim_finalizes(&claims, &present, &delete_failed) {
+        if let Err(e) = spool
+            .finalize_error(&fin.cur_path, fin.reason.message())
+            .await
+        {
+            warn!(path = %fin.cur_path.display(), error = %e, "startup reap: finalize_error");
         }
     }
 }
@@ -266,6 +285,43 @@ enum VmReap {
     },
 }
 
+/// Why the startup reap is finalizing a pre-existing cur/ claim to error/. Both
+/// cases are unmanageable by a fresh consumer (the supervisor that owned the
+/// runner's `limactl shell` session is gone); they differ only in whether a VM
+/// was found, which is useful operator signal in the error/ sidecar + log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupFinalizeReason {
+    /// The claim's managed VM existed and was stopped+deleted this startup.
+    ReapedVm,
+    /// No managed VM existed for this claim: the daemon crashed between
+    /// `try_claim` and `limactl start`, stranding a still-queued job. Finalizing
+    /// lets the reconciler re-mint within a tick instead of after the 6h expiry.
+    NoVm,
+}
+
+impl StartupFinalizeReason {
+    /// The reason string written to the error/ `.err` sidecar (and logged).
+    fn message(self) -> &'static str {
+        match self {
+            StartupFinalizeReason::ReapedVm => {
+                "startup: reaped orphan VM (fresh consumer cannot re-adopt)"
+            }
+            StartupFinalizeReason::NoVm => {
+                "startup: claim had no live VM (crashed between claim and VM creation); reconciler will re-mint"
+            }
+        }
+    }
+}
+
+/// A cur/ claim the startup reap decided to finalize to error/, kept as data so
+/// the *decision* (`plan_startup_claim_finalizes`) is a pure function of its
+/// inputs, separable from the spool *effects* that carry it out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StartupClaimFinalize {
+    cur_path: PathBuf,
+    reason: StartupFinalizeReason,
+}
+
 /// Decide which managed VMs to reap this sweep, purely.
 ///
 /// `live` is `None` when cur/ could not be read this tick. On that uncertainty
@@ -304,6 +360,55 @@ fn plan_vm_reaps(
                 }
             }
         }
+    }
+    plan
+}
+
+/// Decide which pre-existing cur/ claims the startup reap should finalize to
+/// error/, purely.
+///
+/// The startup reap runs BEFORE the supervisor claims or reconciles anything, so
+/// every claim in cur/ belongs to a dead predecessor: its runner's `limactl
+/// shell` session cannot be re-adopted, so the claim is unmanageable regardless
+/// of whether a VM exists. Once the reap has stopped+deleted every managed VM it
+/// could, we therefore finalize every remaining claim to error/ so the
+/// reconciler re-mints any still-queued job within a tick — instead of stranding
+/// it until the 6h stale-claim expiry.
+///
+/// The sole exception is a claim whose VM's delete FAILED (`delete_failed`):
+/// that VM, and its possibly-live runner, may still be up, so finalizing would
+/// make the runner-orphan pass treat a live runner as unbacked and delete it.
+/// Those claims are left for the 6h expiry (the periodic sweep can't re-reap a
+/// current-image VM that still holds a live claim, so that expiry is the
+/// backstop).
+///
+/// `present` is every managed VM name limactl listed; a claim whose vm_name is
+/// absent had no VM at all — the crash between `try_claim` and `limactl start` —
+/// and is classified `NoVm` for the operator record. An empty `claims` (an
+/// unreadable cur/, per the caller) yields an empty plan: nothing is finalized,
+/// same fail-safe as before this pass existed.
+fn plan_startup_claim_finalizes(
+    claims: &HashMap<String, PathBuf>,
+    present: &HashSet<String>,
+    delete_failed: &HashSet<String>,
+) -> Vec<StartupClaimFinalize> {
+    let mut plan = Vec::new();
+    for (vm, cur_path) in claims {
+        // A VM we failed to delete may still be up with a live runner; leaving
+        // its claim intact keeps the runner-orphan pass from deleting that
+        // runner. Such a claim falls back to the 6h stale-claim expiry.
+        if delete_failed.contains(vm) {
+            continue;
+        }
+        let reason = if present.contains(vm) {
+            StartupFinalizeReason::ReapedVm
+        } else {
+            StartupFinalizeReason::NoVm
+        };
+        plan.push(StartupClaimFinalize {
+            cur_path: cur_path.clone(),
+            reason,
+        });
     }
     plan
 }
@@ -1506,6 +1611,123 @@ mod tests {
         // Not our exact name shape -> never touched, even unbacked and idle.
         let runners = vec![mk_runner(1, "gha-runner-1".to_string(), "offline", false)];
         assert!(plan_runner_reaps(&runners, Some(&live)).is_empty());
+    }
+
+    // ---- plan_startup_claim_finalizes (pure startup finalize decision) ----
+
+    /// Exhaustive over the per-claim decision space. A claim is always in
+    /// `claims` (that's the set we iterate); orthogonally it can be present as a
+    /// listed VM or not, and delete-failed or not — 4 combinations, each checked
+    /// against the oracle. In production `delete_failed ⊆ present`, but the
+    /// planner must be correct for any inputs, so present=false with
+    /// delete_failed=true is exercised too: still skipped.
+    #[test]
+    fn plan_startup_claim_finalizes_single_claim_matrix() {
+        let vm = vm_name(1);
+        let path = PathBuf::from("/spool/cur/1.job");
+        for present in [false, true] {
+            for delete_failed in [false, true] {
+                let claims: HashMap<String, PathBuf> =
+                    [(vm.clone(), path.clone())].into_iter().collect();
+                let present_set: HashSet<String> = if present {
+                    [vm.clone()].into_iter().collect()
+                } else {
+                    HashSet::new()
+                };
+                let failed_set: HashSet<String> = if delete_failed {
+                    [vm.clone()].into_iter().collect()
+                } else {
+                    HashSet::new()
+                };
+
+                let plan = plan_startup_claim_finalizes(&claims, &present_set, &failed_set);
+
+                if delete_failed {
+                    assert!(
+                        plan.is_empty(),
+                        "a claim whose VM delete failed must be left for the 6h expiry (present={present})"
+                    );
+                } else {
+                    let want_reason = if present {
+                        StartupFinalizeReason::ReapedVm
+                    } else {
+                        StartupFinalizeReason::NoVm
+                    };
+                    assert_eq!(
+                        plan,
+                        vec![StartupClaimFinalize {
+                            cur_path: path.clone(),
+                            reason: want_reason,
+                        }],
+                        "present={present} delete_failed={delete_failed}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Regression for the reported bug: a claim whose VM was never created
+    /// (crash between try_claim and `limactl start`) is absent from `present`
+    /// but must still be finalized — classified NoVm — so the reconciler
+    /// re-mints within a tick instead of after the 6h stale-claim expiry.
+    #[test]
+    fn plan_startup_claim_finalizes_vm_less_claim_is_no_vm() {
+        let vm = vm_name(7);
+        let path = PathBuf::from("/spool/cur/7.job");
+        let claims: HashMap<String, PathBuf> = [(vm, path.clone())].into_iter().collect();
+        let plan = plan_startup_claim_finalizes(&claims, &HashSet::new(), &HashSet::new());
+        assert_eq!(
+            plan,
+            vec![StartupClaimFinalize {
+                cur_path: path,
+                reason: StartupFinalizeReason::NoVm,
+            }],
+        );
+    }
+
+    /// Unreadable cur/ surfaces as an empty claims map (see the caller's
+    /// `unwrap_or_else`); the planner must then finalize nothing, so no claim is
+    /// touched and the 6h expiry stays the (unchanged) backstop.
+    #[test]
+    fn plan_startup_claim_finalizes_empty_claims_is_empty() {
+        let present: HashSet<String> = [vm_name(1)].into_iter().collect();
+        let delete_failed: HashSet<String> = HashSet::new();
+        assert!(plan_startup_claim_finalizes(&HashMap::new(), &present, &delete_failed).is_empty());
+    }
+
+    /// Multi-claim oracle: the plan finalizes exactly `claims.keys() \
+    /// delete_failed`, each with reason `ReapedVm` iff its VM is present. Built
+    /// from a mixed fixture covering all three fates at once (deleted VM,
+    /// VM-less, delete-failed), compared order-free since HashMap iteration order
+    /// is unspecified.
+    #[test]
+    fn plan_startup_claim_finalizes_oracle_over_mixed_fixture() {
+        let path = |id: u64| PathBuf::from(format!("/spool/cur/{id}.job"));
+        // ids 1..=6, one fate each:
+        //   1,2 -> present & deleted OK      => finalized ReapedVm
+        //   3,4 -> absent (no VM)            => finalized NoVm
+        //   5,6 -> present but delete failed => skipped
+        let claims: HashMap<String, PathBuf> = (1..=6).map(|id| (vm_name(id), path(id))).collect();
+        let present: HashSet<String> = [1, 2, 5, 6].into_iter().map(vm_name).collect();
+        let delete_failed: HashSet<String> = [5, 6].into_iter().map(vm_name).collect();
+
+        let got: HashMap<PathBuf, StartupFinalizeReason> =
+            plan_startup_claim_finalizes(&claims, &present, &delete_failed)
+                .into_iter()
+                .map(|f| (f.cur_path, f.reason))
+                .collect();
+        let want: HashMap<PathBuf, StartupFinalizeReason> = [
+            (path(1), StartupFinalizeReason::ReapedVm),
+            (path(2), StartupFinalizeReason::ReapedVm),
+            (path(3), StartupFinalizeReason::NoVm),
+            (path(4), StartupFinalizeReason::NoVm),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            got, want,
+            "finalize exactly claims\\delete_failed, ReapedVm iff present"
+        );
     }
 
     // ---- live_vm_map_from_cur (filesystem-backed) ----
