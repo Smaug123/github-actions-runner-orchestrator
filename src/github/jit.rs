@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 use reqwest::Client;
@@ -123,7 +123,20 @@ struct BranchCommit {
 
 struct CachedDefaultBranch {
     branch: String,
-    valid_until: Instant,
+    // Wall-clock, not monotonic: a monotonic `Instant` freezes while the host
+    // sleeps, so the entry would live for its whole TTL of *awake* time rather
+    // than wall-clock time. Unlike the installation-token cache there is no
+    // refresh margin — a stale branch name is benign (it's cross-checked
+    // against the job's head_sha downstream), so we serve right up to expiry.
+    valid_until: SystemTime,
+}
+
+impl CachedDefaultBranch {
+    /// Still serveable iff its TTL hasn't elapsed in wall-clock time at `now`.
+    /// Pure so the expiry check is unit-testable without a real clock.
+    fn is_fresh_at(&self, now: SystemTime) -> bool {
+        self.valid_until > now
+    }
 }
 
 pub struct GhClient {
@@ -179,7 +192,7 @@ impl GhClient {
         {
             let cache = self.default_branch_cache.lock().await;
             if let Some(c) = cache.get(&key) {
-                if c.valid_until > Instant::now() {
+                if c.is_fresh_at(SystemTime::now()) {
                     return Ok(c.branch.clone());
                 }
             }
@@ -211,7 +224,7 @@ impl GhClient {
                 key,
                 CachedDefaultBranch {
                     branch: body.default_branch.clone(),
-                    valid_until: Instant::now() + DEFAULT_BRANCH_TTL,
+                    valid_until: SystemTime::now() + DEFAULT_BRANCH_TTL,
                 },
             );
         }
@@ -592,6 +605,36 @@ pub(crate) fn encode_path_segment(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A fixed wall-clock instant well clear of the epoch to anchor TTL maths.
+    fn base() -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)
+    }
+
+    #[test]
+    fn default_branch_fresh_before_ttl() {
+        let t = base();
+        let c = CachedDefaultBranch {
+            branch: "main".into(),
+            valid_until: t + DEFAULT_BRANCH_TTL,
+        };
+        assert!(c.is_fresh_at(t));
+    }
+
+    #[test]
+    fn default_branch_stale_after_wall_clock_advances_past_ttl() {
+        // Regression for the sleep-freeze bug: an entry cached at T lives until
+        // T+TTL of wall time. If the host sleeps and wakes past that, it must
+        // read as stale. A monotonic clock froze during sleep, so the entry
+        // survived its whole TTL of *awake* time instead.
+        let cached = base();
+        let c = CachedDefaultBranch {
+            branch: "main".into(),
+            valid_until: cached + DEFAULT_BRANCH_TTL,
+        };
+        let woke = cached + DEFAULT_BRANCH_TTL + Duration::from_secs(60);
+        assert!(!c.is_fresh_at(woke));
+    }
 
     #[test]
     fn parses_single_job_status() {
