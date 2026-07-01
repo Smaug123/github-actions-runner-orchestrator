@@ -438,6 +438,68 @@ fn plan_runner_reaps<'a>(runners: &'a [Runner], live: Option<&HashSet<String>>) 
         .collect()
 }
 
+/// Decide which GH runners to reap for one repo, reading cur/ *now* — after the
+/// caller obtained `runners` from `list_runners`. Reading here, rather than
+/// reusing a snapshot taken at the top of the sweep, is what closes the
+/// mid-sweep mint race: by the strict `claim → mint → visible-in-list` order,
+/// any runner present in `runners` already had its cur/ claim written before it
+/// could appear in the list, so a cur/ read taken now is guaranteed to observe
+/// that claim. A snapshot from *before* `list_runners` can miss a claim that
+/// lands between the snapshot and the list response, then delete the runner's
+/// registration and strand the still-booting VM in "Registration not found".
+///
+/// `reaped_stale` is the set of stale-image VMs this sweep positively destroyed;
+/// their names are dropped from the fresh live set so their now-offline runners
+/// are still deleted this sweep even if `finalize_error` failed to move the cur/
+/// file (a successful finalize already removed it, so the subtraction only bites
+/// on that rare failure). An unreadable cur/ yields a `None` live set → reap
+/// nothing, the same fail-safe every other reap decision uses on uncertainty.
+async fn plan_runner_reaps_from_cur<'a>(
+    cur_dir: &Path,
+    runners: &'a [Runner],
+    reaped_stale: &HashSet<String>,
+) -> Vec<&'a Runner> {
+    plan_runner_reaps_from_cur_inner(
+        cur_dir,
+        runners,
+        reaped_stale,
+        None::<std::future::Ready<()>>,
+    )
+    .await
+}
+
+/// Test-seam variant of `plan_runner_reaps_from_cur`. `between` (when `Some`)
+/// fires exactly once, after the caller's `list_runners` has returned and before
+/// this function reads cur/ — the window a concurrent mint must land in for the
+/// race regression to bite. Production calls with `None`. Mirrors
+/// `prune_archive_dir_inner`'s `between` seam.
+async fn plan_runner_reaps_from_cur_inner<'a, F>(
+    cur_dir: &Path,
+    runners: &'a [Runner],
+    reaped_stale: &HashSet<String>,
+    between: Option<F>,
+) -> Vec<&'a Runner>
+where
+    F: std::future::Future<Output = ()>,
+{
+    if let Some(hook) = between {
+        hook.await;
+    }
+    let live: Option<HashSet<String>> = match live_vm_names_from_cur(cur_dir).await {
+        Ok(mut set) => {
+            for name in reaped_stale {
+                set.remove(name);
+            }
+            Some(set)
+        }
+        Err(e) => {
+            warn!(error = %e, "gc: cannot read cur/ live claim set for runner reap; reaping no runners this tick");
+            None
+        }
+    };
+    plan_runner_reaps(runners, live.as_ref())
+}
+
 async fn sweep_inner(config: &Config, gh: &GhClient, lima: &Lima) -> anyhow::Result<()> {
     let cur_dir = config.spool_dir.join("cur");
 
@@ -476,6 +538,24 @@ async fn sweep_inner(config: &Config, gh: &GhClient, lima: &Lima) -> anyhow::Res
     // empty live set, which would delete every managed VM and every idle runner
     // and fail their in-flight jobs. (The rest of this sweep likewise fails safe
     // on uncertainty.)
+    //
+    // Read cur/ BEFORE `list_instances`, deliberately — do NOT reorder these.
+    // VM names are a deterministic function of the (never-reused) job id, so a
+    // job re-minted after its previous claim was archived reuses the SAME
+    // `gha-<hash>` name as its old, possibly-still-present VM. If we took the
+    // inventory first and read cur/ after, a re-mint's fresh claim written in
+    // that window would adopt the OLD orphan VM: plan_vm_reaps would treat the
+    // orphan as live and — if its image is stale — finalize the fresh claim to
+    // error/ and delete it, disrupting the re-mint. Reading cur/ first prevents
+    // that: a claim written after this read cannot back a VM in the later
+    // inventory. This ordering is race-free the other direction too — a VM only
+    // appears in `list_instances` long after `try_claim` wrote its claim (claim
+    // precedes `limactl start` precedes list-visibility by far more than the few
+    // ms between this read and the inventory), so no freshly-minted VM is ever
+    // seen here as an orphan. The runner pass has the opposite tradeoff — a large
+    // read→list_runners gap (the whole VM-reap loop, 60s per stop/delete) and no
+    // destructive claim finalize — so it re-reads cur/ AFTER its list; see
+    // `plan_runner_reaps_from_cur`.
     let live_map: Option<HashMap<String, PathBuf>> = match live_vm_map_from_cur(&cur_dir).await {
         Ok(m) => Some(m),
         Err(e) => {
@@ -585,16 +665,6 @@ async fn sweep_inner(config: &Config, gh: &GhClient, lima: &Lima) -> anyhow::Res
         }
     }
 
-    // The live set the runner pass consults: the original claims minus the stale
-    // VMs we just destroyed. `None` (unreadable cur/) stays `None` -> delete no
-    // runners. Orphans were never in the live set, so they need no adjustment.
-    let live_after_reap: Option<HashSet<String>> = live_map.as_ref().map(|m| {
-        m.keys()
-            .filter(|k| !reaped_stale.contains(*k))
-            .cloned()
-            .collect()
-    });
-
     for repo_full in &config.allowed_repos {
         let Some((owner, repo)) = repo_full.split_once('/') else {
             warn!(repo = %sanitize_for_log(repo_full), "gc: allowed repo is not owner/name; skipping");
@@ -602,7 +672,13 @@ async fn sweep_inner(config: &Config, gh: &GhClient, lima: &Lima) -> anyhow::Res
         };
         match gh.list_runners(owner, repo, VM_NAME_PREFIX).await {
             Ok(runners) => {
-                for r in plan_runner_reaps(&runners, live_after_reap.as_ref()) {
+                // Re-read cur/ HERE, after the list_runners response, so a runner
+                // minted since the top-of-sweep snapshot is seen as backed rather
+                // than reaped (the mid-sweep mint race). `reaped_stale` drops the
+                // stale-image VMs we destroyed this sweep so their now-offline
+                // runners are still deleted. `None` (unreadable cur/) -> reap no
+                // runners, same fail-safe as the VM pass.
+                for r in plan_runner_reaps_from_cur(&cur_dir, &runners, &reaped_stale).await {
                     info!(
                         runner = %r.name,
                         repo = %repo_full,
@@ -1611,6 +1687,119 @@ mod tests {
         // Not our exact name shape -> never touched, even unbacked and idle.
         let runners = vec![mk_runner(1, "gha-runner-1".to_string(), "offline", false)];
         assert!(plan_runner_reaps(&runners, Some(&live)).is_empty());
+    }
+
+    // ---- plan_runner_reaps_from_cur (filesystem-backed; authoritative post-list read) ----
+
+    /// Fresh tempdir with a `cur/` holding a `<id>.job` claim file for each id.
+    /// The TempDir is returned so the caller keeps it alive (dropping it deletes
+    /// the tree).
+    async fn cur_with_claims(ids: &[u64]) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let cur = dir.path().join("cur");
+        tokio::fs::create_dir_all(&cur).await.unwrap();
+        for id in ids {
+            tokio::fs::write(cur.join(format!("{id}.job")), b"x")
+                .await
+                .unwrap();
+        }
+        (dir, cur)
+    }
+
+    /// The reported race: a runner whose claim is present in cur/ AT READ TIME is
+    /// kept, even though it may have been minted after the top-of-sweep snapshot.
+    /// Reading cur/ here — after list_runners — is what observes the claim; a
+    /// stale snapshot from the top of the sweep would miss it and delete the
+    /// still-booting runner's registration.
+    #[tokio::test]
+    async fn runner_reaps_from_cur_keeps_backed_runner() {
+        let (_root, cur) = cur_with_claims(&[1]).await;
+        let runners = vec![mk_runner(1, vm_name(1), "online", false)];
+        let plan = plan_runner_reaps_from_cur(&cur, &runners, &HashSet::new()).await;
+        assert!(
+            plan.is_empty(),
+            "a runner backed by a live cur/ claim must be kept"
+        );
+    }
+
+    /// Faithful mid-sweep race regression via the `between` seam: cur/ is empty
+    /// when the caller obtained `runners` (so the runner looks unbacked), then a
+    /// mint lands — the hook writes the claim — before this function reads cur/.
+    /// Because the read happens after the hook, the claim is observed and the
+    /// runner is kept. This is exactly the window (list_runners returns → mint →
+    /// cur/ read) the fix closes; a read taken before the mint deletes the
+    /// still-booting runner.
+    #[tokio::test]
+    async fn runner_reaps_from_cur_honors_mint_after_list() {
+        let (_root, cur) = cur_with_claims(&[]).await;
+        let runners = vec![mk_runner(1, vm_name(1), "online", false)];
+        let cur_h = cur.clone();
+        let hook = async move {
+            tokio::fs::write(cur_h.join("1.job"), b"x").await.unwrap();
+        };
+        let plan =
+            plan_runner_reaps_from_cur_inner(&cur, &runners, &HashSet::new(), Some(hook)).await;
+        assert!(
+            plan.is_empty(),
+            "a claim landing between list_runners and the cur/ read must protect the runner"
+        );
+    }
+
+    /// Empty cur/ at read time → unbacked idle/offline runners are reaped, same
+    /// as the pure planner. Confirms the fresh read doesn't accidentally protect
+    /// genuinely orphaned runners.
+    #[tokio::test]
+    async fn runner_reaps_from_cur_reaps_unbacked() {
+        let (_root, cur) = cur_with_claims(&[]).await;
+        let runners = vec![
+            mk_runner(1, vm_name(1), "offline", false),
+            mk_runner(2, vm_name(2), "online", false),
+        ];
+        let mut ids: Vec<u64> = plan_runner_reaps_from_cur(&cur, &runners, &HashSet::new())
+            .await
+            .iter()
+            .map(|r| r.id)
+            .collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec![1, 2],
+            "unbacked offline and idle-online runners are orphans"
+        );
+    }
+
+    /// Unreadable cur/ (missing dir) → reap nothing, the same fail-safe every
+    /// other reap decision uses on uncertainty. A transient FS error must never
+    /// read as "no live claims" and delete every idle runner.
+    #[tokio::test]
+    async fn runner_reaps_from_cur_none_on_unreadable_reaps_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        let runners = vec![mk_runner(1, vm_name(1), "offline", false)];
+        let plan = plan_runner_reaps_from_cur(&missing, &runners, &HashSet::new()).await;
+        assert!(plan.is_empty(), "unreadable cur/ must reap no runners");
+    }
+
+    /// A stale-image VM the sweep destroyed this tick is in `reaped_stale`; its
+    /// now-offline runner must be reaped even though its claim is still in cur/
+    /// (the finalize_error that would have removed it failed). Subtracting
+    /// reaped_stale from the fresh read preserves the stale-image pass's
+    /// this-sweep runner deletion.
+    #[tokio::test]
+    async fn runner_reaps_from_cur_reaped_stale_overrides_live_claim() {
+        let (_root, cur) = cur_with_claims(&[1]).await;
+        let runners = vec![mk_runner(1, vm_name(1), "offline", false)];
+        let reaped: HashSet<String> = [vm_name(1)].into_iter().collect();
+        let ids: Vec<u64> = plan_runner_reaps_from_cur(&cur, &runners, &reaped)
+            .await
+            .iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![1],
+            "a reaped-stale VM's runner is deleted despite a lingering cur/ claim"
+        );
     }
 
     // ---- plan_startup_claim_finalizes (pure startup finalize decision) ----
