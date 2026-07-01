@@ -169,6 +169,40 @@ impl GhClient {
         self.installations.token(&self.account).await
     }
 
+    /// Send an installation-token-authenticated request, retrying **once** if
+    /// the cached token has gone stale.
+    ///
+    /// `build` produces the request afresh on each attempt — method + url (+
+    /// body) only; this attaches the standard GitHub headers and the bearer
+    /// token, so `build` must set neither. A 401 on the first attempt means the
+    /// cached installation token is stale (revoked, permissions changed,
+    /// installation suspended, or expired): we drop it (`invalidate`), re-mint,
+    /// and retry the same request once. A second 401 is a real error the caller
+    /// surfaces via its own status check.
+    ///
+    /// A failure to *mint* a token surfaces as `Err` from `token()` before any
+    /// `Response` exists, so it never reaches the 401 path — minting is
+    /// JWT-authed against the App key, where a 401 means bad credentials and a
+    /// retry would be futile.
+    async fn send_authed<F>(&self, ctx: &'static str, build: F) -> Result<reqwest::Response>
+    where
+        F: Fn() -> reqwest::RequestBuilder,
+    {
+        fn stamp(rb: reqwest::RequestBuilder, tok: &str) -> reqwest::RequestBuilder {
+            rb.header("Accept", "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", "2022-11-28")
+                .bearer_auth(tok)
+        }
+        let tok = self.token().await?;
+        let resp = stamp(build(), &tok).send().await.context(ctx)?;
+        if resp.status().as_u16() != 401 {
+            return Ok(resp);
+        }
+        self.installations.invalidate(&tok).await;
+        let tok = self.token().await?;
+        stamp(build(), &tok).send().await.context(ctx)
+    }
+
     /// Mint a token scoped to a single repository carrying only
     /// `contents: read`, for the cache warmer's private-flake fetch. Never
     /// cached; the caller writes it to a `0600` netrc and drops it after the
@@ -197,17 +231,10 @@ impl GhClient {
                 }
             }
         }
-        let tok = self.token().await?;
         let url = format!("{}/repos/{}/{}", self.api, owner, repo);
         let resp = self
-            .http
-            .get(&url)
-            .bearer_auth(&tok)
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .send()
-            .await
-            .context("GET /repos/{owner}/{repo}")?;
+            .send_authed("GET /repos/{owner}/{repo}", || self.http.get(&url))
+            .await?;
         if !resp.status().is_success() {
             anyhow::bail!(
                 "default_branch {}/{}: {} {}",
@@ -238,7 +265,6 @@ impl GhClient {
     /// percent-encoded into the path segment. Uses the installation token.
     #[allow(dead_code)] // consumed by the cache warmer (a later slice)
     pub async fn branch_tip(&self, owner: &str, repo: &str, branch: &str) -> Result<String> {
-        let tok = self.token().await?;
         let url = format!(
             "{}/repos/{}/{}/branches/{}",
             self.api,
@@ -247,14 +273,10 @@ impl GhClient {
             encode_path_segment(branch)
         );
         let resp = self
-            .http
-            .get(&url)
-            .bearer_auth(&tok)
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .send()
-            .await
-            .context("GET /repos/{owner}/{repo}/branches/{branch}")?;
+            .send_authed("GET /repos/{owner}/{repo}/branches/{branch}", || {
+                self.http.get(&url)
+            })
+            .await?;
         if !resp.status().is_success() {
             anyhow::bail!(
                 "branch_tip {}/{} {}: {} {}",
@@ -280,7 +302,6 @@ impl GhClient {
         name: &str,
         labels: &[&str],
     ) -> Result<JitConfigResp> {
-        let tok = self.token().await?;
         let url = format!(
             "{}/repos/{}/{}/actions/runners/generate-jitconfig",
             self.api, owner, repo
@@ -292,15 +313,10 @@ impl GhClient {
             work_folder: "_work".to_string(),
         };
         let resp = self
-            .http
-            .post(&url)
-            .bearer_auth(&tok)
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .json(&body)
-            .send()
-            .await
-            .context("POST generate-jitconfig")?;
+            .send_authed("POST generate-jitconfig", || {
+                self.http.post(&url).json(&body)
+            })
+            .await?;
         if !resp.status().is_success() {
             anyhow::bail!(
                 "generate-jitconfig: {} {}",
@@ -314,7 +330,6 @@ impl GhClient {
     /// Return all runners registered on {owner}/{repo} whose name starts with
     /// `prefix`.
     pub async fn list_runners(&self, owner: &str, repo: &str, prefix: &str) -> Result<Vec<Runner>> {
-        let tok = self.token().await?;
         let mut out = Vec::new();
         let mut page = 1u32;
         loop {
@@ -323,14 +338,8 @@ impl GhClient {
                 self.api, owner, repo, page
             );
             let resp = self
-                .http
-                .get(&url)
-                .bearer_auth(&tok)
-                .header("Accept", "application/vnd.github+json")
-                .header("X-GitHub-Api-Version", "2022-11-28")
-                .send()
-                .await
-                .context("GET runners")?;
+                .send_authed("GET runners", || self.http.get(&url))
+                .await?;
             if !resp.status().is_success() {
                 anyhow::bail!(
                     "list runners {}/{}: {} {}",
@@ -368,20 +377,13 @@ impl GhClient {
         repo: &str,
         runner_id: u64,
     ) -> Result<Option<Runner>> {
-        let tok = self.token().await?;
         let url = format!(
             "{}/repos/{}/{}/actions/runners/{}",
             self.api, owner, repo, runner_id
         );
         let resp = self
-            .http
-            .get(&url)
-            .bearer_auth(&tok)
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .send()
-            .await
-            .context("GET runner")?;
+            .send_authed("GET runner", || self.http.get(&url))
+            .await?;
         if resp.status().as_u16() == 404 {
             return Ok(None);
         }
@@ -399,20 +401,13 @@ impl GhClient {
     }
 
     pub async fn delete_runner(&self, owner: &str, repo: &str, runner_id: u64) -> Result<()> {
-        let tok = self.token().await?;
         let url = format!(
             "{}/repos/{}/{}/actions/runners/{}",
             self.api, owner, repo, runner_id
         );
         let resp = self
-            .http
-            .delete(&url)
-            .bearer_auth(&tok)
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .send()
-            .await
-            .context("DELETE runner")?;
+            .send_authed("DELETE runner", || self.http.delete(&url))
+            .await?;
         let s = resp.status();
         // 404 is a benign race: someone (e.g. a re-run of the runner) already
         // deregistered it. Treat as success.
@@ -438,20 +433,11 @@ impl GhClient {
         repo: &str,
         job_id: u64,
     ) -> Result<Option<JobStatus>> {
-        let tok = self.token().await?;
         let url = format!(
             "{}/repos/{}/{}/actions/jobs/{}",
             self.api, owner, repo, job_id
         );
-        let resp = self
-            .http
-            .get(&url)
-            .bearer_auth(&tok)
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .send()
-            .await
-            .context("GET job")?;
+        let resp = self.send_authed("GET job", || self.http.get(&url)).await?;
         if resp.status().as_u16() == 404 {
             return Ok(None);
         }
@@ -479,7 +465,6 @@ impl GhClient {
     /// runner-assignable jobs yet; when one becomes queued the run moves into a
     /// status we scan, so we don't miss it. Requires `Actions: read`.
     pub async fn list_queued_jobs(&self, owner: &str, repo: &str) -> Result<Vec<JobStatus>> {
-        let tok = self.token().await?;
         let mut out: Vec<JobStatus> = Vec::new();
         for status in ["queued", "in_progress"] {
             let mut page = 1u32;
@@ -488,15 +473,7 @@ impl GhClient {
                     "{}/repos/{}/{}/actions/runs?status={}&per_page=100&page={}",
                     self.api, owner, repo, status, page
                 );
-                let resp = self
-                    .http
-                    .get(&url)
-                    .bearer_auth(&tok)
-                    .header("Accept", "application/vnd.github+json")
-                    .header("X-GitHub-Api-Version", "2022-11-28")
-                    .send()
-                    .await
-                    .context("GET runs")?;
+                let resp = self.send_authed("GET runs", || self.http.get(&url)).await?;
                 if !resp.status().is_success() {
                     anyhow::bail!(
                         "list runs {}/{} status={}: {} {}",
@@ -510,7 +487,7 @@ impl GhClient {
                 let body: RunsResp = resp.json().await?;
                 let n = body.workflow_runs.len();
                 for run in body.workflow_runs {
-                    for mut job in self.list_run_jobs(owner, repo, run.id, &tok).await? {
+                    for mut job in self.list_run_jobs(owner, repo, run.id).await? {
                         if job.status == "queued" {
                             job.repo_id = run.repository.id;
                             out.push(job);
@@ -531,15 +508,10 @@ impl GhClient {
     }
 
     /// All jobs for a single run (any status). Pagination mirrors
-    /// `list_runners`. Takes an already-minted token to avoid re-minting once
-    /// per run inside `list_queued_jobs`.
-    async fn list_run_jobs(
-        &self,
-        owner: &str,
-        repo: &str,
-        run_id: u64,
-        tok: &str,
-    ) -> Result<Vec<JobStatus>> {
+    /// `list_runners`. Each page is fetched through `send_authed`, so the
+    /// cached installation token is reused (a lock + clone, not a network mint)
+    /// and a mid-pagination 401 recovers instead of poisoning the rest.
+    async fn list_run_jobs(&self, owner: &str, repo: &str, run_id: u64) -> Result<Vec<JobStatus>> {
         let mut out = Vec::new();
         let mut page = 1u32;
         loop {
@@ -548,14 +520,8 @@ impl GhClient {
                 self.api, owner, repo, run_id, page
             );
             let resp = self
-                .http
-                .get(&url)
-                .bearer_auth(tok)
-                .header("Accept", "application/vnd.github+json")
-                .header("X-GitHub-Api-Version", "2022-11-28")
-                .send()
-                .await
-                .context("GET run jobs")?;
+                .send_authed("GET run jobs", || self.http.get(&url))
+                .await?;
             if !resp.status().is_success() {
                 anyhow::bail!(
                     "list run jobs {}/{} run={}: {} {}",
@@ -728,5 +694,145 @@ mod tests {
             .map(|j| j.id)
             .collect();
         assert_eq!(queued, vec![1]);
+    }
+
+    // ---- 401 invalidate-and-retry, end to end against a fake GitHub ----
+    //
+    // These exercise the real wiring — token mint, request, 401, cache
+    // invalidation, re-mint, retry — that no unit test can stand in for.
+
+    use axum::extract::State;
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::routing::{get, post};
+    use axum::{Json, Router};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex as StdMutex;
+    use tokio::net::TcpListener;
+    use zeroize::Zeroizing;
+
+    #[derive(Clone)]
+    struct Fake {
+        /// How many installation tokens have been minted. Each mint returns a
+        /// distinct `tok-N` so tests can prove the retry used a *fresh* token.
+        mints: Arc<AtomicU64>,
+        /// How many times the runners endpoint was hit.
+        runner_hits: Arc<AtomicU64>,
+        /// The `Authorization` header seen on each runners request, in order.
+        auths: Arc<StdMutex<Vec<String>>>,
+        /// If true, the runners endpoint 401s on *every* request; otherwise
+        /// only the first, to model a single stale-token episode.
+        always_401: bool,
+    }
+
+    async fn fake_installation() -> Json<serde_json::Value> {
+        Json(serde_json::json!({ "id": 42 }))
+    }
+
+    async fn fake_mint(State(f): State<Fake>) -> Json<serde_json::Value> {
+        let n = f.mints.fetch_add(1, Ordering::SeqCst) + 1;
+        Json(serde_json::json!({
+            "token": format!("tok-{n}"),
+            "expires_at": "2099-01-01T00:00:00Z",
+        }))
+    }
+
+    async fn fake_runners(
+        State(f): State<Fake>,
+        headers: HeaderMap,
+    ) -> (StatusCode, Json<serde_json::Value>) {
+        let auth = headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        f.auths.lock().unwrap().push(auth);
+        let hit = f.runner_hits.fetch_add(1, Ordering::SeqCst);
+        if f.always_401 || hit == 0 {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({ "message": "Bad credentials" })),
+            )
+        } else {
+            (StatusCode::OK, Json(serde_json::json!({ "runners": [] })))
+        }
+    }
+
+    async fn spawn_fake(f: Fake) -> String {
+        let router = Router::new()
+            .route("/users/:account/installation", get(fake_installation))
+            .route("/app/installations/:id/access_tokens", post(fake_mint))
+            .route("/repos/:owner/:repo/actions/runners", get(fake_runners))
+            .with_state(f);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    fn client(base: &str) -> GhClient {
+        let auth = super::super::installation::AppAuth {
+            app_id: 42,
+            pem: Arc::new(Zeroizing::new(super::super::app_jwt::TEST_PEM.to_vec())),
+        };
+        let http = reqwest::Client::new();
+        let inst = Arc::new(Installations::new(base.to_string(), http.clone(), auth));
+        GhClient::new(base.to_string(), http, "octocat".to_string(), inst)
+    }
+
+    fn fake(always_401: bool) -> Fake {
+        Fake {
+            mints: Arc::new(AtomicU64::new(0)),
+            runner_hits: Arc::new(AtomicU64::new(0)),
+            auths: Arc::new(StdMutex::new(Vec::new())),
+            always_401,
+        }
+    }
+
+    #[tokio::test]
+    async fn retries_once_on_401_with_a_freshly_minted_token() {
+        let f = fake(false);
+        let base = spawn_fake(f.clone()).await;
+        let c = client(&base);
+
+        let runners = c.list_runners("octocat", "hello-world", "runner-").await;
+        assert!(runners.is_ok(), "retry should recover: {runners:?}");
+        assert!(runners.unwrap().is_empty());
+
+        // One mint for the initial (stale) token, one after invalidation.
+        assert_eq!(f.mints.load(Ordering::SeqCst), 2);
+        let auths = f.auths.lock().unwrap();
+        assert_eq!(auths.as_slice(), ["Bearer tok-1", "Bearer tok-2"]);
+    }
+
+    #[tokio::test]
+    async fn reuses_cached_token_after_recovery() {
+        let f = fake(false);
+        let base = spawn_fake(f.clone()).await;
+        let c = client(&base);
+
+        // First call mints tok-1, 401s, invalidates, re-mints tok-2, succeeds.
+        c.list_runners("octocat", "hello-world", "runner-")
+            .await
+            .unwrap();
+        // Second call must reuse the cached tok-2 — no 401, so no new mint.
+        c.list_runners("octocat", "hello-world", "runner-")
+            .await
+            .unwrap();
+
+        assert_eq!(f.mints.load(Ordering::SeqCst), 2, "second call re-minted");
+    }
+
+    #[tokio::test]
+    async fn bounded_retry_surfaces_a_persistent_401() {
+        let f = fake(true);
+        let base = spawn_fake(f.clone()).await;
+        let c = client(&base);
+
+        let res = c.list_runners("octocat", "hello-world", "runner-").await;
+        assert!(res.is_err(), "a persistent 401 must surface as an error");
+        // Exactly one retry: initial mint + one re-mint, and two requests. No
+        // unbounded loop.
+        assert_eq!(f.mints.load(Ordering::SeqCst), 2);
+        assert_eq!(f.runner_hits.load(Ordering::SeqCst), 2);
     }
 }
