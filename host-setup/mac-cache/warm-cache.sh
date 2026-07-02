@@ -150,63 +150,14 @@ target_system="aarch64-linux"
 # --- lock --------------------------------------------------------------------
 # ONE host-level lock around the whole mutating sequence (requirement 5). The
 # server is a separate process and a second warm could run concurrently, so an
-# in-process mutex is insufficient — we need a filesystem lock.
-#
-# macOS does NOT ship flock(1) (util-linux) and /usr/bin/shlock is not reliably
-# present, so we use an ATOMIC mkdir lock: mkdir either creates the dir (we hold
-# the lock) or fails because it already exists (someone else holds it). This is
-# atomic on POSIX with no external tool. The lockdir lives OUTSIDE the served
-# docroot (under $base) so it is never exposed and never trips the serve gate.
-#
-# A stale lock (a previous warm killed mid-run) would otherwise wedge all future
-# warms. We record our PID inside the lockdir; if acquisition fails we check
-# whether the recorded PID is still alive and, only if it is dead, reclaim the
-# lock. We do NOT auto-reclaim a live lock.
-lock_dir="$base/warm-cache.lock"
-# `held` gates the release trap: we must only ever rm the lock dir we actually
-# own. Without this, failing to acquire (e.g. the timeout below) would fire the
-# EXIT trap and delete the LIVE holder's lock — corrupting their critical
-# section. Set to 1 only after a successful mkdir.
-held=0
-release_lock() {
-  if [ "$held" -eq 1 ]; then
-    rm -rf "$lock_dir" 2>/dev/null || true
-  fi
-}
-# Release on EXIT (covers set -e aborts and normal completion) and on signals.
-# Armed before acquire_lock, but gated by $held so it is a no-op until we own it.
+# in-process mutex is insufficient. The lock (an atomic PID-carrying symlink,
+# stale-reclaim, and the ABA-safe reclaim serialization) lives in common.sh so
+# warm-cache.sh and warm-flake-inputs.sh share exactly one lock by path. We
+# install the release trap here — not in common.sh — so sourcing common.sh never
+# clobbers init/serve's own EXIT handling.
 trap 'release_lock' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-
-acquire_lock() {
-  local tries=0 owner
-  while ! mkdir "$lock_dir" 2>/dev/null; do
-    owner=""
-    [ -f "$lock_dir/pid" ] && owner="$(cat "$lock_dir/pid" 2>/dev/null || true)"
-    if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then
-      tries=$((tries + 1))
-      if [ "$tries" -ge 60 ]; then
-        echo "error: could not acquire $lock_dir after 60s; warm/serve held by live PID $owner." >&2
-        exit 1
-      fi
-      sleep 1
-      continue
-    fi
-    # No live owner: the lock is stale (holder died, leaving an empty/orphaned
-    # lockdir). Reclaim it: remove the dir then loop to re-mkdir. A race here
-    # just means another waiter wins the re-mkdir and we keep waiting — still
-    # correct. (Residual narrow window: a holder that has mkdir'd but not yet
-    # written its pid looks "stale"; we accept that, the writer writes pid on the
-    # very next line. Acceptable for a manual v1 warmer.)
-    echo "warn: reclaiming stale lock $lock_dir (owner PID '${owner:-unknown}' not alive)." >&2
-    rm -rf "$lock_dir" 2>/dev/null || true
-  done
-  # We hold it. Mark held BEFORE writing pid so the release trap will clean up
-  # even if the pid write fails, then record our PID for stale-detection.
-  held=1
-  echo "$$" > "$lock_dir/pid"
-}
 
 acquire_lock
 
