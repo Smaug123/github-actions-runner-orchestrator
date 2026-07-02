@@ -465,7 +465,14 @@ impl Config {
         Ok(())
     }
 
-    pub fn validate(&self) -> Result<()> {
+    pub fn validate(&mut self) -> Result<()> {
+        // Normalize the comma-delimited lists first: clap's ',' split keeps empty
+        // segments ("a,,b" -> ["a","","b"]) and any surrounding whitespace (" o/r"),
+        // neither of which can match a real repo/label — a padded allowlist entry
+        // would silently reject authentic jobs. Trim and drop empties so the
+        // emptiness check below also fires on an all-blank value.
+        normalize_list(&mut self.allowed_repos);
+        normalize_list(&mut self.runner_labels);
         if self.allowed_repos.is_empty() {
             anyhow::bail!("GH_ALLOWED_REPOS is empty; refusing to start with no repo allowlist");
         }
@@ -567,6 +574,12 @@ impl Config {
                  and must bind a loopback address"
             );
         }
+        if addr.port() == 0 {
+            anyhow::bail!(
+                "CONTROL_ADDR {addr} uses port 0; that binds an arbitrary ephemeral port \
+                 an operator can't predict or connect to. Pin an explicit port."
+            );
+        }
         Ok(Some(addr))
     }
 
@@ -609,6 +622,20 @@ impl Config {
         }
         anyhow::bail!("set GH_WEBHOOK_SECRET or GH_WEBHOOK_SECRET_FILE")
     }
+}
+
+/// Trim whitespace from each entry of a comma-delimited config list and drop the
+/// empties. `--flag=a,,b ` (clap splits on ',') parses to `["a", "", "b "]`; this
+/// makes it `["a", "b"]`. An all-blank value collapses to an empty Vec so the
+/// callers' non-empty checks reject it.
+fn normalize_list(v: &mut Vec<String>) {
+    for s in v.iter_mut() {
+        let trimmed = s.trim();
+        if trimmed.len() != s.len() {
+            *s = trimmed.to_string();
+        }
+    }
+    v.retain(|s| !s.is_empty());
 }
 
 /// Ensure a private working directory exists at `p` with mode 0700, owned by
@@ -809,14 +836,39 @@ fn verify_trusted_path(p: &Path, require_exec: bool) -> Result<()> {
             mode & 0o777
         );
     }
-    if require_exec && mode & 0o111 == 0 {
-        anyhow::bail!(
-            "{} mode {:04o} has no execute bit set",
-            p.display(),
-            mode & 0o777
-        );
+    if require_exec {
+        // "Any execute bit set" is not enough: a root-owned 0700 binary has the
+        // owner-exec bit but the non-root daemon can't exec it, so it would fail
+        // confusingly at spawn instead of at startup. Check the bit the daemon
+        // can actually use given ownership.
+        let euid = unsafe { libc::geteuid() };
+        if !executable_by(md.uid(), euid, mode) {
+            anyhow::bail!(
+                "{} (mode {:04o}, owner uid {}) is not executable by this daemon (uid {}); \
+                 a trusted binary must be owner-executable if we own it, else world-executable",
+                p.display(),
+                mode & 0o777,
+                md.uid(),
+                euid
+            );
+        }
     }
     Ok(())
+}
+
+/// Whether a process with effective uid `euid` can execute a regular file owned
+/// by `owner_uid` with permission `mode`. If we own it, the owner-execute bit
+/// governs; otherwise we rely on the world-execute bit. We conservatively ignore
+/// group membership, so a group-exec-only file owned by another user is rejected
+/// — make such a trusted binary world-executable (system binaries already are)
+/// or place it under an owner-owned dir. This catches at startup a binary the
+/// daemon could never spawn (e.g. a root-owned 0700).
+fn executable_by(owner_uid: u32, euid: u32, mode: u32) -> bool {
+    if owner_uid == euid {
+        mode & 0o100 != 0
+    } else {
+        mode & 0o001 != 0
+    }
 }
 
 /// Validate a directory that holds the warmer's trusted exec/source targets: an
@@ -1061,6 +1113,68 @@ mod tests {
     }
 
     #[test]
+    fn control_addr_rejects_port_zero() {
+        let mut c = base_config();
+        c.control_addr = Some("127.0.0.1:0".to_string());
+        let err = c.control_socket_addr().unwrap_err().to_string();
+        assert!(err.contains("port 0"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn control_addr_accepts_explicit_loopback_port() {
+        let mut c = base_config();
+        c.control_addr = Some("127.0.0.1:9099".to_string());
+        let addr = c.control_socket_addr().unwrap().expect("some addr");
+        assert_eq!(addr.port(), 9099);
+        assert!(addr.ip().is_loopback());
+    }
+
+    #[test]
+    fn normalize_list_trims_and_drops_empty_segments() {
+        let mut v = vec![
+            "o/r".to_string(),
+            String::new(),
+            "  o/s ".to_string(),
+            "   ".to_string(),
+        ];
+        normalize_list(&mut v);
+        assert_eq!(v, vec!["o/r".to_string(), "o/s".to_string()]);
+        // An all-blank list collapses to empty (so the caller's is_empty fires).
+        let mut blank = vec![String::new(), "  ".to_string()];
+        normalize_list(&mut blank);
+        assert!(blank.is_empty());
+    }
+
+    #[test]
+    fn validate_normalizes_padded_allowlist_and_labels() {
+        let mut c = base_config();
+        c.allowed_repos = vec!["o/r".into(), " o/s ".into(), String::new()];
+        c.runner_labels = vec!["self-hosted".into(), "".into(), " lima-nix ".into()];
+        c.runner_label = "lima-nix".into();
+        c.validate().unwrap();
+        assert_eq!(c.allowed_repos, vec!["o/r".to_string(), "o/s".to_string()]);
+        assert_eq!(
+            c.runner_labels,
+            vec!["self-hosted".to_string(), "lima-nix".to_string()]
+        );
+    }
+
+    #[test]
+    fn executable_by_owner_needs_owner_exec() {
+        // We own it: owner-exec governs.
+        assert!(executable_by(1000, 1000, 0o700));
+        assert!(!executable_by(1000, 1000, 0o600));
+    }
+
+    #[test]
+    fn executable_by_other_owner_needs_world_exec() {
+        // Owned by someone else (e.g. root uid 0): only world-exec lets us run it.
+        assert!(executable_by(0, 1000, 0o755)); // world-exec
+        assert!(!executable_by(0, 1000, 0o700)); // the root-owned-0700 gap
+        assert!(!executable_by(0, 1000, 0o750)); // group-exec only: conservatively rejected
+    }
+
+    #[test]
     fn reject_path_separator_flags_only_colon_bearing_dirs() {
         // A colon-free dir is accepted; the error names the offending var and
         // mentions PATH so the operator can see why startup refused it.
@@ -1246,7 +1360,7 @@ mod tests {
         std::fs::write(&p, b"#!/bin/sh\n").unwrap();
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
         let err = verify_trusted_executable(&p).unwrap_err().to_string();
-        assert!(err.contains("execute bit"), "unexpected error: {err}");
+        assert!(err.contains("not executable"), "unexpected error: {err}");
     }
 
     #[test]
@@ -1297,7 +1411,7 @@ mod tests {
         verify_trusted_file(&p).expect("0644 file owned by us should pass the file check");
         // ...but the executable check must still reject it for the missing bit.
         let err = verify_trusted_executable(&p).unwrap_err().to_string();
-        assert!(err.contains("execute bit"), "unexpected error: {err}");
+        assert!(err.contains("not executable"), "unexpected error: {err}");
     }
 
     #[test]

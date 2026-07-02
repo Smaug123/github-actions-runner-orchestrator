@@ -857,16 +857,30 @@ fn nix_conf_contents(netrc_path: &Path, substituters: &str, trusted_public_keys:
 /// otherwise the Mac cache pubkey (read from `<base>/keys/<name>.public`) plus
 /// the well-known cache.nixos.org key, so the build can verify both caches.
 fn resolve_trusted_public_keys(configured: &str, mac_pubkey_file: &Path) -> Result<String> {
-    if !configured.trim().is_empty() {
-        return Ok(configured.trim().to_string());
+    let resolved = if !configured.trim().is_empty() {
+        configured.trim().to_string()
+    } else {
+        let raw = std::fs::read_to_string(mac_pubkey_file)
+            .with_context(|| format!("read cache public key {}", mac_pubkey_file.display()))?;
+        let mac = raw.trim();
+        if mac.is_empty() {
+            anyhow::bail!("cache public key {} is empty", mac_pubkey_file.display());
+        }
+        format!("{mac} {CACHE_NIXOS_ORG_KEY}")
+    };
+    // trusted-public-keys is written as a single nix.conf line. An embedded
+    // newline — a multi-line .public file, or a multi-line override — would split
+    // that line and silently corrupt the private nix.conf, so every warm's build
+    // would reject the cache with only debug-level evidence. Reject it loudly
+    // here. (Interior spaces are fine: the value is a space-separated key list.)
+    if resolved.contains(['\n', '\r']) {
+        anyhow::bail!(
+            "trusted-public-keys contains a newline; a cache public key must be a single \
+             line (`name:base64`). Check {} (or the WARM_TRUSTED_PUBLIC_KEYS override).",
+            mac_pubkey_file.display()
+        );
     }
-    let raw = std::fs::read_to_string(mac_pubkey_file)
-        .with_context(|| format!("read cache public key {}", mac_pubkey_file.display()))?;
-    let mac = raw.trim();
-    if mac.is_empty() {
-        anyhow::bail!("cache public key {} is empty", mac_pubkey_file.display());
-    }
-    Ok(format!("{mac} {CACHE_NIXOS_ORG_KEY}"))
+    Ok(resolved)
 }
 
 /// A filesystem-safe, per-*attempt* directory name. `owner`/`repo`/`sha` are
@@ -1184,6 +1198,28 @@ mod tests {
         );
         // Missing pubkey file -> error (only when deriving).
         assert!(resolve_trusted_public_keys("", &dir.path().join("nope")).is_err());
+    }
+
+    #[test]
+    fn resolve_trusted_keys_rejects_multiline_pubkey_and_override() {
+        let dir = tempfile::tempdir().unwrap();
+        // A multi-line .public file (interior newline survives the trim) would
+        // corrupt the single-line nix.conf value; must be rejected.
+        let multi = dir.path().join("gha-mac-cache-1.public");
+        std::fs::write(&multi, "gha-mac-cache-1:AAAA\nextra-key:BBBB\n").unwrap();
+        let err = resolve_trusted_public_keys("", &multi)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("newline"), "unexpected error: {err}");
+        // A multi-line override is rejected too.
+        let ok = dir.path().join("ok.public");
+        std::fs::write(&ok, "gha-mac-cache-1:AAAA\n").unwrap();
+        assert!(resolve_trusted_public_keys("k1:AAAA\nk2:BBBB", &ok).is_err());
+        // A space-separated override (a valid multi-key list) is accepted.
+        assert_eq!(
+            resolve_trusted_public_keys("k1:AAAA k2:BBBB", &ok).unwrap(),
+            "k1:AAAA k2:BBBB"
+        );
     }
 
     #[test]

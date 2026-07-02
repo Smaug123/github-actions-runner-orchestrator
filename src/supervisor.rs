@@ -81,6 +81,9 @@ pub async fn run(rt: Runtime) -> Result<()> {
         // Bind here, not inside the task, so a failure (e.g. port in use) fails
         // startup rather than silently leaving no control endpoint.
         let listener = crate::control::bind(addr).await?;
+        // Log the address we actually bound (from the listener), not the
+        // configured one, so the operator sees the real endpoint.
+        let bound_addr = listener.local_addr().unwrap_or(addr);
         // VM-snapshot poller: publishes the daemon's own view of its managed
         // Lima VMs so the control UI reads a cached snapshot instead of spawning
         // limactl per request. Only runs while the control server is enabled.
@@ -108,7 +111,7 @@ pub async fn run(rt: Runtime) -> Result<()> {
                 error!(error = %format!("{e:#}"), "control server exited");
             }
         });
-        info!(%addr, "control server listening");
+        info!(addr = %bound_addr, "control server listening");
     }
 
     crate::gc::sweep(&config, &gh, &lima).await;
