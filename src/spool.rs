@@ -190,6 +190,16 @@ impl Spool {
         }
         between_checks.await;
         let to = self.cur_dir().join(name);
+        // Stamp the source to now BEFORE the claim. rename preserves the inode's
+        // mtime, so the cur/ entry is born carrying our fresh claim-time mtime —
+        // there is never an instant where it exists with the (possibly stale)
+        // new/ mtime. Stamping after the rename instead would leave a window in
+        // which a long-downtime backlog entry (a new/ file older than the GC age
+        // threshold) is visible in cur/ with that old mtime, and a concurrent
+        // expire_stale_cur sweep could reap the job we just claimed before it
+        // runs. A missing/irregular source is a no-op here (the rename then
+        // fails, or read_spool_file later rejects it).
+        stamp_mtime_now(&from);
         match rename_no_clobber(&from, &to) {
             Ok(()) => {
                 // Authoritative archive check. The pre-check above is a fast
@@ -207,7 +217,6 @@ impl Spool {
                     }
                     return Ok(None);
                 }
-                stamp_mtime_now(&to);
                 Ok(Some(to))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
