@@ -524,7 +524,7 @@ async fn sweep_inner(config: &Config, gh: &GhClient, lima: &Lima) -> anyhow::Res
     expire_stale_cur(
         &cur_dir,
         &config.spool_dir.join("error"),
-        config.job_max_runtime_secs,
+        cur_claim_max_age_secs(config),
     )
     .await?;
 
@@ -907,6 +907,47 @@ fn build_event(full_name: &str, job: &JobStatus) -> WorkflowJob {
             full_name: full_name.to_string(),
         },
     }
+}
+
+/// Worst-case GitHub round-trips for one installation-token-authed call
+/// (`send_authed`): it sends once and, on a stale-token 401, refreshes the token
+/// and sends again — 2 sends. Each of those (up to 2) `token()` refreshes is
+/// itself up to 2 requests: resolve the installation id (once, cold) then mint
+/// the token. So at most 6 requests, each bounded by `api_timeout_secs`.
+const GH_ROUNDTRIPS_PER_CALL: u64 = 6;
+
+/// How old a cur/ claim may get before `expire_stale_cur` treats it as an
+/// orphaned leftover (owning worker crashed/panicked without finalizing) rather
+/// than a job still in flight.
+///
+/// A claim's mtime is stamped when it enters cur/ (at `try_claim`), but
+/// `job_max_runtime_secs` is the `limactl shell` *deadline*, which only begins
+/// after the JIT mint and the VM boot+seed, and the claim is then held through
+/// the post-run serial capture, teardown, and the completion check. Anchoring
+/// expiry to `job_max_runtime_secs` alone would reap a job in roughly its final
+/// (mint + boot + seed) minutes: `expire_stale_cur` moves the live claim to
+/// error/, and because the live-VM set is rebuilt from cur/ later in the *same*
+/// sweep, the now-claimless VM is classified as an orphan and destroyed mid-run
+/// — the job then fails on GitHub with no re-mint. Pad the threshold by the full
+/// non-shell overhead so an in-flight job is never reaped.
+///
+/// The overhead is every `limactl` invocation around the run
+/// (`lima::VM_PER_JOB_COMMAND_BUDGET`) plus every GitHub call made while the
+/// claim is held: the JIT mint before boot, `delete_runner` at teardown, and —
+/// when `job_completion_check` is on (the default) — the `job_status` GET before
+/// `finalize_done`. Saturating arithmetic keeps an operator who sets an enormous
+/// `job_max_runtime_secs` / `api_timeout_secs` from wrapping.
+fn cur_claim_max_age_secs(config: &Config) -> u64 {
+    // mint + teardown delete_runner, plus the optional completion-check GET.
+    let gh_calls: u64 = if config.job_completion_check { 3 } else { 2 };
+    let api_budget = config
+        .api_timeout_secs
+        .saturating_mul(GH_ROUNDTRIPS_PER_CALL)
+        .saturating_mul(gh_calls);
+    config
+        .job_max_runtime_secs
+        .saturating_add(api_budget)
+        .saturating_add(crate::lima::VM_PER_JOB_COMMAND_BUDGET.as_secs())
 }
 
 async fn expire_stale_cur(
@@ -2229,6 +2270,108 @@ mod tests {
                 .checked_sub(std::time::Duration::from_secs(2))
                 .unwrap(),
             "expired archive mtime must be ~expiry time, not the backdated claim time; got {m:?}"
+        );
+    }
+
+    /// Minimal Config for GC threshold tests; only job_max_runtime_secs and
+    /// api_timeout_secs are consulted by cur_claim_max_age_secs.
+    fn gc_test_config(job_max_runtime_secs: u64, api_timeout_secs: u64) -> Config {
+        use clap::Parser;
+        Config::try_parse_from([
+            "test",
+            "--spool-dir=/tmp",
+            "--state-dir=/tmp",
+            "--app-id=1",
+            "--app-private-key-file=/tmp/key",
+            "--org=o",
+            "--lima-template=/tmp/lima.yaml",
+            "--limactl-path=/usr/bin/true",
+            "--allowed-repos=o/r",
+            &format!("--job-max-runtime-secs={job_max_runtime_secs}"),
+            &format!("--api-timeout-secs={api_timeout_secs}"),
+        ])
+        .unwrap()
+    }
+
+    #[test]
+    fn cur_claim_max_age_pads_job_runtime_by_full_overhead() {
+        let vm = crate::lima::VM_PER_JOB_COMMAND_BUDGET.as_secs();
+        // Completion check on (default): 3 GitHub calls (mint, delete_runner,
+        // job_status) plus every per-job limactl command.
+        let on = gc_test_config(100, 10);
+        assert!(on.job_completion_check);
+        assert_eq!(
+            cur_claim_max_age_secs(&on),
+            100 + GH_ROUNDTRIPS_PER_CALL * 3 * 10 + vm
+        );
+
+        // The property that matters: the threshold clears the job's runtime plus
+        // at least the pre-shell VM boot+seed, so a job running to its deadline is
+        // never reaped mid-run.
+        assert!(cur_claim_max_age_secs(&on) > 100 + vm);
+    }
+
+    #[test]
+    fn cur_claim_max_age_drops_completion_check_call_when_disabled() {
+        let vm = crate::lima::VM_PER_JOB_COMMAND_BUDGET.as_secs();
+        let mut off = gc_test_config(100, 10);
+        off.job_completion_check = false;
+        // 2 GitHub calls instead of 3 (no job_status GET before finalize).
+        assert_eq!(
+            cur_claim_max_age_secs(&off),
+            100 + GH_ROUNDTRIPS_PER_CALL * 2 * 10 + vm
+        );
+        // Disabling the completion check drops exactly one GitHub call's budget.
+        let on = gc_test_config(100, 10);
+        assert_eq!(
+            cur_claim_max_age_secs(&on) - cur_claim_max_age_secs(&off),
+            GH_ROUNDTRIPS_PER_CALL * 10
+        );
+    }
+
+    #[test]
+    fn cur_claim_max_age_saturates_instead_of_wrapping() {
+        let config = gc_test_config(u64::MAX, u64::MAX);
+        assert_eq!(cur_claim_max_age_secs(&config), u64::MAX);
+    }
+
+    /// The bug: a job still legitimately in flight past job_max_runtime_secs from
+    /// its claim (it spent the pre-shell budget booting) must NOT be expired,
+    /// while a genuinely orphaned claim past the full threshold still is.
+    #[tokio::test]
+    async fn expire_stale_cur_spares_job_within_preshell_slack() {
+        let dir = tempfile::tempdir().unwrap();
+        let cur = dir.path().join("cur");
+        let err = dir.path().join("error");
+        tokio::fs::create_dir_all(&cur).await.unwrap();
+        tokio::fs::create_dir_all(&err).await.unwrap();
+
+        let config = gc_test_config(100, 10);
+        let threshold = cur_claim_max_age_secs(&config);
+
+        // Aged past the naive job_max_runtime (100s) but within the padded
+        // threshold: an in-flight job that spent its pre-shell budget booting.
+        let live = cur.join("1.job");
+        tokio::fs::write(&live, b"x").await.unwrap();
+        backdate(&live, 200);
+        assert!(200 > config.job_max_runtime_secs && 200 < threshold);
+
+        // Aged past the full threshold: a genuine orphan.
+        let orphan = cur.join("2.job");
+        tokio::fs::write(&orphan, b"x").await.unwrap();
+        backdate(&orphan, threshold + 100);
+
+        expire_stale_cur(&cur, &err, threshold).await.unwrap();
+
+        assert!(live.exists(), "in-flight job within slack must be spared");
+        assert!(
+            !err.join("1.job").exists(),
+            "in-flight job must not be archived to error/"
+        );
+        assert!(!orphan.exists(), "genuine orphan must be reaped");
+        assert!(
+            err.join("2.job").exists(),
+            "genuine orphan must land in error/"
         );
     }
 

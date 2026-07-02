@@ -43,6 +43,29 @@ const DELETE_TIMEOUT: Duration = Duration::from_secs(60);
 const COPY_TIMEOUT: Duration = Duration::from_secs(60);
 const LIST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Upper bound on the wall-clock all the per-job `limactl` invocations can
+/// consume *around* the job's own `shell` run (which is bounded separately by
+/// its caller-supplied deadline). Summed from the individual command timeouts
+/// with the multiplicity each occurs while a job's cur/ claim is held:
+///
+///   * `start` (boot) + `copy` (seed the JIT blob) before the run;
+///   * one `list` for the post-run serial-console capture (`serial_log_tail`);
+///   * `stop` + `delete` at teardown, plus one more `list` when `delete`
+///     re-checks presence after a non-zero/timed-out delete.
+///
+/// (The remaining per-job work — writing the JIT blob, reading the serial tail,
+/// the final rename — is local filesystem I/O with no timeout, negligible next
+/// to these.) The GC adds this, plus a GitHub-API budget, to a job's runtime
+/// budget when deciding a cur/ claim is a stale orphan rather than an in-flight
+/// job; see `gc::cur_claim_max_age_secs`.
+pub const VM_PER_JOB_COMMAND_BUDGET: Duration = Duration::from_secs(
+    START_TIMEOUT.as_secs()
+        + COPY_TIMEOUT.as_secs()
+        + STOP_TIMEOUT.as_secs()
+        + DELETE_TIMEOUT.as_secs()
+        + 2 * LIST_TIMEOUT.as_secs(),
+);
+
 impl Lima {
     pub fn new(bin: PathBuf) -> Self {
         Self { bin }
