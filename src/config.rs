@@ -579,6 +579,17 @@ impl Config {
     }
 
     pub fn load_webhook_secret(&self) -> Result<Zeroizing<Vec<u8>>> {
+        // Refuse when both sources are set rather than silently preferring the
+        // inline value. Otherwise rotating the file while a stale
+        // GH_WEBHOOK_SECRET lingers in the environment is a silent footgun: the
+        // daemon keeps HMAC-verifying against the old inline secret, so every
+        // authentic delivery fails the check and is archived to error/ — a
+        // breakage the reconciler would then mask. Fail loud at startup instead.
+        if self.webhook_secret.is_some() && self.webhook_secret_file.is_some() {
+            anyhow::bail!(
+                "set exactly one of GH_WEBHOOK_SECRET or GH_WEBHOOK_SECRET_FILE, not both"
+            );
+        }
         if let Some(s) = &self.webhook_secret {
             if s.is_empty() {
                 anyhow::bail!("GH_WEBHOOK_SECRET is set but empty");
@@ -1001,6 +1012,53 @@ fn stage_trusted_template(src: &Path, dst: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Minimal Config from the required flags. Each webhook-secret test then sets
+    /// the two secret fields EXPLICITLY rather than via flags/env: clap applies
+    /// `env = "GH_WEBHOOK_SECRET(_FILE)"` for any flag not on the command line,
+    /// so a daemon-configured shell/CI would otherwise leak a real source in.
+    /// Overwriting the parsed fields makes these tests env-independent.
+    fn base_config() -> Config {
+        Config::try_parse_from([
+            "test",
+            "--spool-dir=/tmp",
+            "--state-dir=/tmp",
+            "--app-id=1",
+            "--app-private-key-file=/tmp/key",
+            "--org=o",
+            "--lima-template=/tmp/lima.yaml",
+            "--limactl-path=/usr/bin/true",
+            "--allowed-repos=o/r",
+        ])
+        .unwrap()
+    }
+
+    #[test]
+    fn webhook_secret_both_sources_set_bails() {
+        let mut c = base_config();
+        c.webhook_secret = Some("inline".to_string());
+        c.webhook_secret_file = Some(PathBuf::from("/tmp/whatever"));
+        let err = c.load_webhook_secret().unwrap_err().to_string();
+        assert!(err.contains("not both"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn webhook_secret_inline_only_is_used() {
+        let mut c = base_config();
+        c.webhook_secret = Some("hunter2".to_string());
+        c.webhook_secret_file = None;
+        let s = c.load_webhook_secret().unwrap();
+        assert_eq!(&*s, b"hunter2");
+    }
+
+    #[test]
+    fn webhook_secret_neither_source_bails() {
+        let mut c = base_config();
+        c.webhook_secret = None;
+        c.webhook_secret_file = None;
+        let err = c.load_webhook_secret().unwrap_err().to_string();
+        assert!(err.contains("GH_WEBHOOK_SECRET"), "unexpected error: {err}");
+    }
 
     #[test]
     fn reject_path_separator_flags_only_colon_bearing_dirs() {
