@@ -553,6 +553,14 @@ pub(crate) fn classify_validated_entry(
         ));
     }
     if event.action != "queued" {
+        // Drop -> archived to done/ by the caller. This is only safe because the
+        // spooler pins action=queued at ingress (gh-webhook-spool webhook.rs), so
+        // a non-queued action for a given job id never reaches new/. If it ever
+        // did, archiving it to done/ under `<job_id>.job` would set the replay
+        // marker for that id and permanently block the *real* later `queued`
+        // webhook for the same job (try_claim's is_archived check would treat it
+        // as already handled). Keep that coupling in mind before relaxing the
+        // spooler's ingress filter.
         return EntryVerdict::Drop(format!("action={}", event.action));
     }
     // Shared label policy: the gate label must be present and every requested

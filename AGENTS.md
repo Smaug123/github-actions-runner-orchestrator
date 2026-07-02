@@ -50,10 +50,10 @@ nix build              # release binary
 ```
 src/main.rs        — CLI parse, file-mode checks, startup self-check, ctrl_c
 src/config.rs      — Config + validate() + ensure_paths() + perm helpers
-src/spool.rs       — Spool (claim/finalize), read_spool_file, DeliveryId,
+src/spool.rs       — Spool (claim/finalize), read_spool_file, Envelope,
                      HMAC verify, file-shape filter, mtime stamp on claim
 src/supervisor.rs  — dispatch loop; prepare() is the validation choke point
-src/runner.rs      — per-job state machine; vm_name(repo, job_id)
+src/runner.rs      — per-job state machine; vm_name(job_id)
 src/gc.rs          — sweep (stale cur/, orphan VMs, offline runners) +
                      reconcile (mint for still-queued jobs lacking a runner)
 src/warm.rs        — signing-cache warmer (3c, opt-in): on a default-branch tip,
@@ -74,8 +74,9 @@ src/github/        — App JWT, installation tokens (account-scoped), JIT mint
    never come from `new/`; they carry an HMAC we compute ourselves over
    authenticated GitHub API data, so they stay re-verifiable.)
 2. **VM names come from signed body fields only.** Envelope/delivery is
-   **not** under the HMAC. Use `runner::vm_name(repo, job_id)`;
-   `DeliveryId` is for logging and as a filename sanity check. The
+   **not** under the HMAC. Use `runner::vm_name(job_id)` over the signed
+   `workflow_job.id`; the envelope's `delivery` field is for logging, and
+   the filename's job id is cross-checked against the signed body. The
    reconciler sources `workflow_job.id` from the authenticated Actions
    API instead of a signed body — at least as trustworthy — and feeds it
    through the same `vm_name`.
