@@ -42,12 +42,12 @@
 #  - SIGN DURING COPY. The destination `file://$cache_dir?secret-key=$secret_key`
 #    signs each narinfo with the Mac key as it is written; the signature name
 #    (gha-mac-cache-1) must stay one the guests carry (3b) or they reject it.
-#  - SHARED HOST LOCK. Takes warm-cache.sh's EXACT lock dir ($base/warm-cache.lock)
+#  - SHARED HOST LOCK. Takes warm-cache.sh's EXACT lock path ($base/warm-cache.lock)
 #    so an input-warm and a closure-warm (or two of either) cannot interleave
-#    docroot writes (warm-cache.sh requirement 5). The lock is by PATH — atomic
-#    mkdir on the same dir — so cross-process exclusion holds even though the lock
-#    code is duplicated here rather than shared (kept self-contained to leave the
-#    reviewed warm-cache.sh untouched; a later DRY pass can hoist it to common.sh).
+#    docroot writes (warm-cache.sh requirement 5). The lock is by PATH — an atomic
+#    PID-carrying symlink at the same path — so cross-process exclusion holds. The
+#    lock logic now lives once in common.sh (both warmers source it), so this
+#    script just installs the release trap and calls acquire_lock.
 #  - STREAM via `nix copy --stdin`. An input set (nixpkgs source + the rest) is
 #    many paths; never splat them into argv (E2BIG). Bounded argv, one copy.
 #  - MANIFEST outside the docroot, to manifest/inputs-warmed.log (kept SEPARATE
@@ -141,45 +141,16 @@ fi
 
 # --- lock --------------------------------------------------------------------
 # ONE host-level lock around the whole mutating sequence, SHARED WITH warm-cache.sh
-# by using its exact lock dir: two docroot writers (a closure-warm and an
+# by using its exact lock path: two docroot writers (a closure-warm and an
 # input-warm, or two of either) must not interleave their copy + manifest writes
-# (warm-cache.sh requirement 5). mkdir is atomic create-or-fail on POSIX (macOS
-# ships no flock(1)); the lock is by PATH, so exclusion holds across the two
-# scripts even though this is a separate copy of the logic.
-lock_dir="$base/warm-cache.lock"
-# `held` gates the release trap: only ever rm the lock dir we actually own, so a
-# failed acquire never deletes the live holder's lock. Set to 1 only after mkdir.
-held=0
-release_lock() {
-  if [ "$held" -eq 1 ]; then
-    rm -rf "$lock_dir" 2>/dev/null || true
-  fi
-}
+# (warm-cache.sh requirement 5). The lock logic (an atomic PID-carrying symlink,
+# stale-reclaim, and the ABA-safe reclaim serialization) lives in common.sh so
+# both warmers share exactly one lock by path. We install the release trap here —
+# not in common.sh — so sourcing common.sh never clobbers init/serve's own EXIT
+# handling.
 trap 'release_lock' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-
-acquire_lock() {
-  local tries=0 owner
-  while ! mkdir "$lock_dir" 2>/dev/null; do
-    owner=""
-    [ -f "$lock_dir/pid" ] && owner="$(cat "$lock_dir/pid" 2>/dev/null || true)"
-    if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then
-      tries=$((tries + 1))
-      if [ "$tries" -ge 60 ]; then
-        echo "error: could not acquire $lock_dir after 60s; warm held by live PID $owner." >&2
-        exit 1
-      fi
-      sleep 1
-      continue
-    fi
-    # No live owner: stale lock (holder died). Reclaim and re-mkdir.
-    echo "warn: reclaiming stale lock $lock_dir (owner PID '${owner:-unknown}' not alive)." >&2
-    rm -rf "$lock_dir" 2>/dev/null || true
-  done
-  held=1
-  echo "$$" > "$lock_dir/pid"
-}
 
 acquire_lock
 
