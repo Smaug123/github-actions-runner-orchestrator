@@ -550,6 +550,19 @@ async fn sweep_inner(config: &Config, gh: &GhClient, lima: &Lima) -> anyhow::Res
     )
     .await;
 
+    // Prune orphaned JIT blobs. A blob is written at a job's start and unlinked
+    // at teardown, so under normal operation it lives less than a job's lifetime;
+    // a crash between the two orphans it, and if that job never re-runs it would
+    // otherwise sit in instances/ forever (it also carries a runner registration,
+    // so it is mildly sensitive). Age it out past the same bound cur/ claims use,
+    // which exceeds the longest a live job's blob can exist, so an in-flight job's
+    // blob is never pruned.
+    prune_stale_jit_blobs(
+        &config.state_dir.join("instances"),
+        cur_claim_max_age_secs(config),
+    )
+    .await;
+
     // vm_name -> cur/ path for every live claim, or `None` when cur/ could not
     // be read this tick. Every reap decision below treats `None` as "unknown —
     // reap nothing": a transient unreadable cur/ must never be mistaken for an
@@ -1206,6 +1219,106 @@ async fn prune_serial_logs(logs_dir: &Path, retention_secs: u64) {
     if removed > 0 {
         info!(dir = %logs_dir.display(), removed, bytes_freed, "gc: pruned old serial-console logs");
     }
+}
+
+/// Prune orphaned JIT blobs (`<instances_dir>/<vm>.jit`, written by
+/// `runner::write_jit_blob` at a job's start and unlinked at teardown) older than
+/// `max_age_secs`. A crash between write and teardown orphans one; for a job that
+/// never re-runs it would otherwise linger forever.
+///
+/// Callers pass a `max_age_secs` above the longest a live job's blob can exist
+/// (`cur_claim_max_age_secs`), so an in-flight job's blob is never pruned. Scoped
+/// to the `.jit` suffix; symlinks (lstat-based `metadata`) and other entries are
+/// skipped. Best-effort: per-file failures are logged and skipped, a missing dir
+/// treated as empty.
+///
+/// Unlike `prune_serial_logs`, the same path CAN be legitimately re-created while
+/// we scan: `write_jit_blob` removes+recreates `<vm>.jit` when the reconciler
+/// re-runs a job whose crashed attempt left an orphan. So the age is re-checked
+/// (a second lstat) immediately before the unlink; a blob whose mtime is now
+/// fresh is a live retry's config and is left alone. That shrinks the
+/// scan->unlink race to a re-check->unlink window of a couple of syscalls; if a
+/// re-mint's rewrite still lands inside it the job simply fails setup once and
+/// the reconciler re-mints — the same self-healing path as any failed setup.
+async fn prune_stale_jit_blobs(instances_dir: &Path, max_age_secs: u64) {
+    prune_stale_jit_blobs_inner(instances_dir, max_age_secs, None::<std::future::Ready<()>>).await
+}
+
+/// Test-seam variant. `between` (when `Some`) fires exactly once, after the first
+/// blob is judged expired by the directory-iteration stat and before the
+/// re-check + unlink — the window a concurrent `write_jit_blob` re-mint must hit.
+/// Production calls with `None`. Mirrors `prune_archive_dir_inner`.
+async fn prune_stale_jit_blobs_inner<F>(
+    instances_dir: &Path,
+    max_age_secs: u64,
+    mut between: Option<F>,
+) where
+    F: std::future::Future<Output = ()>,
+{
+    let mut rd = match tokio::fs::read_dir(instances_dir).await {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            warn!(dir = %instances_dir.display(), error = %e, "gc: instances dir unreadable during prune");
+            return;
+        }
+    };
+    let mut removed: u64 = 0;
+    loop {
+        let ent = match rd.next_entry().await {
+            Ok(Some(ent)) => ent,
+            Ok(None) => break,
+            Err(e) => {
+                warn!(dir = %instances_dir.display(), error = %e, "gc: read_dir failed mid-prune; stopping dir");
+                break;
+            }
+        };
+        let name = ent.file_name();
+        if !name.to_string_lossy().ends_with(".jit") {
+            continue;
+        }
+        // lstat-based: a symlink shows as non-regular here and is skipped.
+        let md = match ent.metadata().await {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if !md.is_file() || !jit_blob_expired(&md, max_age_secs) {
+            continue;
+        }
+        if let Some(f) = between.take() {
+            f.await;
+        }
+        // Re-check right before unlinking: a re-mint may have replaced this path
+        // with a fresh blob since the scan above. A blob that is now a regular
+        // file younger than the threshold is a live retry — leave it.
+        match tokio::fs::symlink_metadata(ent.path()).await {
+            Ok(m2) if m2.is_file() && jit_blob_expired(&m2, max_age_secs) => {}
+            // Fresh (re-minted), vanished, or no longer a regular file: skip.
+            _ => continue,
+        }
+        match tokio::fs::remove_file(ent.path()).await {
+            Ok(()) => removed += 1,
+            // Raced a concurrent removal (e.g. a job's own teardown); fine.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                warn!(file = %sanitize_for_log(&name.to_string_lossy()), error = %e, "gc: failed to prune JIT blob")
+            }
+        }
+    }
+    if removed > 0 {
+        info!(dir = %instances_dir.display(), removed, "gc: pruned orphaned JIT blobs");
+    }
+}
+
+/// A JIT blob is prunable when its mtime is older than `max_age_secs`. Measured
+/// against a fresh `now` each call so the re-check sees a re-minted blob's fresh
+/// mtime; a mtime in the future (clock skew) reads as age 0 (kept).
+fn jit_blob_expired(md: &std::fs::Metadata, max_age_secs: u64) -> bool {
+    let now = std::time::SystemTime::now();
+    let age = now
+        .duration_since(md.modified().unwrap_or(now))
+        .unwrap_or_default();
+    age.as_secs() > max_age_secs
 }
 
 /// Derive the expected vm_name for each cur/ file straight from its
@@ -2523,6 +2636,77 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // logs/ is never created; must not panic.
         prune_serial_logs(&dir.path().join("logs"), TWO_DAYS).await;
+    }
+
+    #[tokio::test]
+    async fn prune_stale_jit_blobs_removes_old_keeps_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let inst = dir.path().join("instances");
+        tokio::fs::create_dir_all(&inst).await.unwrap();
+        let orphan = inst.join("gha-0000000000000001.jit");
+        let live = inst.join("gha-0000000000000002.jit");
+        for p in [&orphan, &live] {
+            tokio::fs::write(p, b"jitconfig").await.unwrap();
+        }
+        backdate(&orphan, TWO_DAYS + 3600);
+        // `live` keeps its ~now mtime; threshold 1 day so orphan (2d+) is past it.
+
+        prune_stale_jit_blobs(&inst, 24 * 60 * 60).await;
+
+        assert!(!orphan.exists(), "orphaned JIT blob should be pruned");
+        assert!(live.exists(), "an in-window JIT blob must be kept");
+    }
+
+    #[tokio::test]
+    async fn prune_stale_jit_blobs_skips_unrelated_and_non_regular() {
+        let dir = tempfile::tempdir().unwrap();
+        let inst = dir.path().join("instances");
+        tokio::fs::create_dir_all(&inst).await.unwrap();
+        let unrelated = inst.join("notes.txt");
+        tokio::fs::write(&unrelated, b"keep").await.unwrap();
+        backdate(&unrelated, TWO_DAYS + 3600);
+        let subdir = inst.join("weird.jit");
+        tokio::fs::create_dir_all(&subdir).await.unwrap();
+
+        prune_stale_jit_blobs(&inst, TWO_DAYS).await;
+
+        assert!(unrelated.exists(), "non-.jit entries must be skipped");
+        assert!(subdir.exists(), "non-regular entries must be skipped");
+    }
+
+    #[tokio::test]
+    async fn prune_stale_jit_blobs_tolerates_missing_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        prune_stale_jit_blobs(&dir.path().join("instances"), TWO_DAYS).await;
+    }
+
+    // A re-mint that rewrites the blob fresh in the scan->unlink window must not
+    // be pruned: the seam fires after the entry is judged expired and before the
+    // re-check + unlink, standing in for write_jit_blob re-creating the path.
+    #[tokio::test]
+    async fn prune_stale_jit_blobs_spares_blob_re_minted_during_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let inst = dir.path().join("instances");
+        tokio::fs::create_dir_all(&inst).await.unwrap();
+        let blob = inst.join("gha-0000000000000001.jit");
+        tokio::fs::write(&blob, b"stale").await.unwrap();
+        backdate(&blob, TWO_DAYS + 3600);
+
+        let blob_for_hook = blob.clone();
+        let between = async move {
+            // Simulate the reconciler re-minting this job id: replace the blob
+            // with a fresh one (fresh mtime), as write_jit_blob does.
+            tokio::fs::remove_file(&blob_for_hook).await.unwrap();
+            tokio::fs::write(&blob_for_hook, b"fresh").await.unwrap();
+        };
+
+        prune_stale_jit_blobs_inner(&inst, 24 * 60 * 60, Some(between)).await;
+
+        assert!(
+            blob.exists(),
+            "a blob re-minted during the scan must be kept"
+        );
+        assert_eq!(std::fs::read(&blob).unwrap(), b"fresh");
     }
 
     #[tokio::test]
