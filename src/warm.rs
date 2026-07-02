@@ -123,6 +123,25 @@ impl Coalescer {
         seen.insert(key, now);
         true
     }
+
+    /// Drop `key` so the next `check_and_mark` for it proceeds immediately, but
+    /// ONLY if the stored mark is still the one inserted at `marked`. Used when a
+    /// marked warm failed *before* doing any build work, so a transient blip
+    /// doesn't suppress retries of the same tip for the whole TTL.
+    ///
+    /// The `marked` guard matters because a slow pre-build failure can outlive
+    /// `ttl`: by the time we clear, another event may have expired our entry and
+    /// inserted its own (a newer in-flight warm). Removing unconditionally would
+    /// delete that newer mark and let a third event start a duplicate warm. Two
+    /// inserts for the same key are always >ttl apart (a within-ttl second event
+    /// is coalesced, not inserted), so their `Instant`s never collide and the
+    /// equality check unambiguously identifies our own mark.
+    fn clear(&self, key: &CoalesceKey, marked: Instant) {
+        let mut seen = self.seen.lock().expect("coalescer mutex poisoned");
+        if seen.get(key) == Some(&marked) {
+            seen.remove(key);
+        }
+    }
 }
 
 pub struct Warmer {
@@ -277,17 +296,25 @@ impl Warmer {
         // (the atomic mark dedups any that pass concurrently), and the same tip
         // won't re-warm within the TTL. Marking here — not at entry — is what
         // keeps the drop/lookup-failure/non-tip paths above retryable.
-        if !self
-            .coalescer
-            .check_and_mark(cand.coalesce_key(), Instant::now())
-        {
+        let marked = Instant::now();
+        if !self.coalescer.check_and_mark(cand.coalesce_key(), marked) {
             debug!(
                 owner = %cand.owner, repo = %cand.repo, sha = %cand.head_sha,
                 "cache-warm: coalesced (already warmed or in flight)"
             );
             return;
         }
-        self.run_warm(&cand, &default_branch).await;
+        if !self.run_warm(&cand, &default_branch).await {
+            // A pre-build transient failure (contents-token mint or workdir
+            // setup) left nothing warmed. Drop *our* mark so a later event for
+            // this same tip retries — matching the retryability of the drop/
+            // lookup/non-tip paths above — instead of suppressing it for the
+            // whole TTL. Passing `marked` ensures we only clear our own mark, not
+            // a newer in-flight warm that replaced it if we ran past the TTL. A
+            // failure *during* the build keeps the mark, so a persistently
+            // failing build isn't re-attempted on every event.
+            self.coalescer.clear(&cand.coalesce_key(), marked);
+        }
     }
 
     /// Build the flake at the default-branch tip and copy the signed closure
@@ -305,7 +332,12 @@ impl Warmer {
     /// eval-time build, blocked by the config/argv pin) and a host-system
     /// *input* derivation smuggled into an otherwise-aarch64-linux target
     /// (rejected by the full-closure system check below, per target).
-    async fn run_warm(&self, cand: &WarmCandidate, branch: &str) {
+    /// Returns `true` once it reaches the build phase (whatever the per-target
+    /// build outcomes), `false` on a pre-build transient failure (token mint or
+    /// workdir setup). The caller uses that to decide whether to keep the
+    /// coalescer mark: a pre-build blip should be retryable, a build attempt
+    /// should stand so a persistently-failing build isn't re-run on every event.
+    async fn run_warm(&self, cand: &WarmCandidate, branch: &str) -> bool {
         let flakeref = build_flakeref(&cand.owner, &cand.repo, branch, &cand.head_sha);
 
         // Down-scoped contents:read token for just this repo. Never the broad
@@ -315,7 +347,7 @@ impl Warmer {
             Err(e) => {
                 debug!(owner = %cand.owner, repo = %cand.repo, error = %format!("{e:#}"),
                     "cache-warm: contents token mint failed");
-                return;
+                return false;
             }
         };
 
@@ -337,7 +369,7 @@ impl Warmer {
             Err(e) => {
                 debug!(owner = %cand.owner, repo = %cand.repo, error = %format!("{e:#}"),
                     "cache-warm: workdir setup failed");
-                return;
+                return false;
             }
         };
         // The token is now only on disk (0600 netrc); drop the in-memory copy.
@@ -405,6 +437,7 @@ impl Warmer {
                 .await;
         }
         // workdir drops here: netrc unlinked, out-links (gcroots) released.
+        true // reached the build phase; per-target outcomes don't unset the mark
     }
 
     /// Scrubbed environment for every warmer child: a private HOME/XDG_* (so the
@@ -1048,6 +1081,44 @@ mod tests {
         // Past the TTL the same tip may warm again.
         let later = t0 + Duration::from_secs(61);
         assert!(c.check_and_mark(k, later), "expired entry reopens");
+    }
+
+    #[test]
+    fn coalescer_clear_allows_immediate_retry() {
+        // A pre-build warm failure clears our mark so the same tip retries at
+        // once, rather than being suppressed for the whole TTL.
+        let c = Coalescer::new(Duration::from_secs(60));
+        let k = key("o", "r", "main", SHA);
+        let t0 = Instant::now();
+        assert!(c.check_and_mark(k.clone(), t0), "first warm proceeds");
+        assert!(!c.check_and_mark(k.clone(), t0), "same tip is coalesced");
+        c.clear(&k, t0);
+        assert!(
+            c.check_and_mark(k, t0),
+            "after clear the same tip may warm again immediately"
+        );
+    }
+
+    #[test]
+    fn coalescer_clear_leaves_a_newer_mark_intact() {
+        // A slow pre-build failure can outlive the TTL: by the time it clears,
+        // another event has expired the old entry and marked a fresh in-flight
+        // warm. clear(marked=old) must NOT remove that newer mark, or a third
+        // event would start a duplicate concurrent warm.
+        let c = Coalescer::new(Duration::from_secs(60));
+        let k = key("o", "r", "main", SHA);
+        let t0 = Instant::now();
+        assert!(c.check_and_mark(k.clone(), t0), "first warm proceeds");
+        // A later event past the TTL replaces the entry with its own mark.
+        let t1 = t0 + Duration::from_secs(61);
+        assert!(c.check_and_mark(k.clone(), t1), "expired entry reopens");
+        // The first warm now fails pre-build and clears with its OLD mark time.
+        c.clear(&k, t0);
+        // The newer mark must survive, so a third event is still coalesced.
+        assert!(
+            !c.check_and_mark(k, t1),
+            "the newer in-flight mark must not have been cleared"
+        );
     }
 
     #[test]
