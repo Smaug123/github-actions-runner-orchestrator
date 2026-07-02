@@ -86,9 +86,7 @@ use crate::github::event::{Repository, WorkflowJob, WorkflowJobInfo};
 use crate::github::jit::{GhClient, JobStatus, Runner};
 use crate::lima::Lima;
 use crate::runner::vm_name;
-use crate::spool::{
-    lock_archive_mutation, parse_spool_filename, sanitize_for_log, stamp_mtime_now, Spool,
-};
+use crate::spool::{lock_archive_mutation, parse_spool_filename, sanitize_for_log, Spool};
 use crate::supervisor::{classify_job_labels, spawn_job, LabelVerdict};
 
 const VM_NAME_PREFIX: &str = "gha-";
@@ -520,13 +518,9 @@ where
 
 async fn sweep_inner(config: &Config, gh: &GhClient, lima: &Lima) -> anyhow::Result<()> {
     let cur_dir = config.spool_dir.join("cur");
+    let spool = Spool::new(config.spool_dir.clone());
 
-    expire_stale_cur(
-        &cur_dir,
-        &config.spool_dir.join("error"),
-        cur_claim_max_age_secs(config),
-    )
-    .await?;
+    expire_stale_cur(&spool, cur_claim_max_age_secs(config)).await?;
 
     // Prune finalized entries (done/ + error/) past the retention window so the
     // archive maildirs — which try_claim's replay check and the control UI both
@@ -599,8 +593,6 @@ async fn sweep_inner(config: &Config, gh: &GhClient, lima: &Lima) -> anyhow::Res
     // read/parse the staged template; in that case we skip stale-image reaping
     // entirely (we have nothing to compare against) rather than reap blindly.
     let current_image = current_template_image(&config.lima_template).await;
-
-    let spool = Spool::new(config.spool_dir.clone());
 
     // Enumerate managed VMs. For a VM that still holds a live claim, read the
     // image it booted so plan_vm_reaps can classify it as stale-or-not; orphans
@@ -963,12 +955,9 @@ fn cur_claim_max_age_secs(config: &Config) -> u64 {
         .saturating_add(crate::lima::VM_PER_JOB_COMMAND_BUDGET.as_secs())
 }
 
-async fn expire_stale_cur(
-    cur_dir: &Path,
-    error_dir: &Path,
-    max_age_secs: u64,
-) -> anyhow::Result<()> {
-    let mut rd = tokio::fs::read_dir(cur_dir).await?;
+async fn expire_stale_cur(spool: &Spool, max_age_secs: u64) -> anyhow::Result<()> {
+    let cur_dir = spool.cur_dir();
+    let mut rd = tokio::fs::read_dir(&cur_dir).await?;
     let now = std::time::SystemTime::now();
     while let Some(ent) = rd.next_entry().await? {
         let md = match ent.metadata().await {
@@ -980,25 +969,19 @@ async fn expire_stale_cur(
         if age.as_secs() > max_age_secs {
             let name = ent.file_name();
             warn!(file = %sanitize_for_log(&name.to_string_lossy()), age_secs = age.as_secs(), "stale cur/ entry -> error/");
-            let from = ent.path();
-            let to = error_dir.join(&name);
-            let err_path = error_dir.join(format!("{}.err", name.to_string_lossy()));
-            let _ = tokio::fs::write(
-                &err_path,
-                format!(
-                    "expired by gc: age {}s > {}s\n",
-                    age.as_secs(),
-                    max_age_secs
-                ),
-            )
-            .await;
-            match tokio::fs::rename(&from, &to).await {
-                // rename preserves the claim-time mtime; stamp the archive to
-                // now so the "completed" view reads expiry (= finish) time, and
-                // a long-claimed job expired now isn't filtered out of the
-                // recent-completions window.
-                Ok(()) => stamp_mtime_now(&to),
-                Err(e) => warn!(error = %e, "rename stale cur/ -> error/"),
+            // Route through finalize_error rather than a bare rename: it takes
+            // the archive-mutation lock (so a concurrent prune can't unlink the
+            // marker in its expiry->delete window) and archives via `archive()`,
+            // which preserves any prior error/<id> marker as a .bak instead of
+            // silently clobbering it. It also writes the .err sidecar and stamps
+            // the archive to expiry-time, matching the old behavior.
+            let reason = format!(
+                "expired by gc: age {}s > {}s\n",
+                age.as_secs(),
+                max_age_secs
+            );
+            if let Err(e) = spool.finalize_error(&ent.path(), &reason).await {
+                warn!(file = %sanitize_for_log(&name.to_string_lossy()), error = %e, "expire stale cur/ -> error/ failed");
             }
         }
     }
@@ -2353,14 +2336,23 @@ mod tests {
     /// A stale cur/ entry expired into error/ must carry an expiry-time mtime,
     /// not the preserved claim-time one — otherwise a long-claimed job expired
     /// now would be filtered out of the control UI's recent-completions window.
+    ///
+    /// A fresh Spool root with cur/, error/, done/ created.
+    async fn spool_root() -> (tempfile::TempDir, Spool) {
+        let dir = tempfile::tempdir().unwrap();
+        for sub in ["cur", "error", "done"] {
+            tokio::fs::create_dir_all(dir.path().join(sub))
+                .await
+                .unwrap();
+        }
+        let spool = Spool::new(dir.path().to_path_buf());
+        (dir, spool)
+    }
+
     #[tokio::test]
     async fn expire_stale_cur_stamps_archive_mtime_to_now() {
-        let dir = tempfile::tempdir().unwrap();
-        let cur = dir.path().join("cur");
-        let err = dir.path().join("error");
-        tokio::fs::create_dir_all(&cur).await.unwrap();
-        tokio::fs::create_dir_all(&err).await.unwrap();
-        let job = cur.join("60.job");
+        let (_dir, spool) = spool_root().await;
+        let job = spool.cur_dir().join("60.job");
         tokio::fs::write(&job, b"x").await.unwrap();
         // Backdate well past the max age so it's expired.
         let backdate = std::time::SystemTime::now() - std::time::Duration::from_secs(10_000);
@@ -2370,9 +2362,9 @@ mod tests {
             .unwrap();
 
         let before = std::time::SystemTime::now();
-        expire_stale_cur(&cur, &err, 3600).await.unwrap();
+        expire_stale_cur(&spool, 3600).await.unwrap();
 
-        let archived = err.join("60.job");
+        let archived = spool.error_dir().join("60.job");
         assert!(
             archived.exists(),
             "stale entry should be archived to error/"
@@ -2384,6 +2376,38 @@ mod tests {
                 .unwrap(),
             "expired archive mtime must be ~expiry time, not the backdated claim time; got {m:?}"
         );
+    }
+
+    /// Expiring a cur/ entry whose id already has an error/ marker (e.g. a prior
+    /// forensic record) must preserve the old marker as a .bak, not clobber it.
+    #[tokio::test]
+    async fn expire_stale_cur_preserves_existing_error_marker() {
+        let (_dir, spool) = spool_root().await;
+        // A prior marker for the same job id sits in error/.
+        let prior = spool.error_dir().join("60.job");
+        tokio::fs::write(&prior, b"prior-marker").await.unwrap();
+
+        let job = spool.cur_dir().join("60.job");
+        tokio::fs::write(&job, b"live").await.unwrap();
+        backdate(&job, 10_000);
+
+        expire_stale_cur(&spool, 3600).await.unwrap();
+
+        assert!(
+            spool.error_dir().join("60.job").exists(),
+            "the expired marker must be installed"
+        );
+        // The prior marker must survive as error/60.job.<millis>.bak.
+        let mut rd = tokio::fs::read_dir(spool.error_dir()).await.unwrap();
+        let mut found_bak = false;
+        while let Some(ent) = rd.next_entry().await.unwrap() {
+            let n = ent.file_name().to_string_lossy().into_owned();
+            if n.starts_with("60.job.") && n.ends_with(".bak") {
+                found_bak = true;
+                assert_eq!(std::fs::read(ent.path()).unwrap(), b"prior-marker");
+            }
+        }
+        assert!(found_bak, "prior error/ marker must be preserved as a .bak");
     }
 
     /// Minimal Config for GC threshold tests; only job_max_runtime_secs and
@@ -2453,11 +2477,9 @@ mod tests {
     /// while a genuinely orphaned claim past the full threshold still is.
     #[tokio::test]
     async fn expire_stale_cur_spares_job_within_preshell_slack() {
-        let dir = tempfile::tempdir().unwrap();
-        let cur = dir.path().join("cur");
-        let err = dir.path().join("error");
-        tokio::fs::create_dir_all(&cur).await.unwrap();
-        tokio::fs::create_dir_all(&err).await.unwrap();
+        let (_dir, spool) = spool_root().await;
+        let cur = spool.cur_dir();
+        let err = spool.error_dir();
 
         let config = gc_test_config(100, 10);
         let threshold = cur_claim_max_age_secs(&config);
@@ -2474,7 +2496,7 @@ mod tests {
         tokio::fs::write(&orphan, b"x").await.unwrap();
         backdate(&orphan, threshold + 100);
 
-        expire_stale_cur(&cur, &err, threshold).await.unwrap();
+        expire_stale_cur(&spool, threshold).await.unwrap();
 
         assert!(live.exists(), "in-flight job within slack must be spared");
         assert!(
