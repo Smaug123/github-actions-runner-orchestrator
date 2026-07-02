@@ -27,10 +27,12 @@
 //   * any GH runner with our `gha-` prefix that isn't backed by a live cur/
 //     file and is offline (or simply not busy) is DELETEd via API.
 //
-// `live` is built by reading each cur/ file's body and computing the same
-// vm_name the supervisor would: signed (repo, workflow_job.id) → SHA-256.
-// We never derive a vm_name from envelope/header data; using only signed
-// fields means a replay produces the same name we already know about.
+// `live` is built from each cur/ file's NAME, not its body: the filename is
+// `<workflow_job.id>.job`, and vm_name is a deterministic function of that id
+// (`gha-<16hex>`), the same one the supervisor and runner use. The id is a
+// signed body field the supervisor cross-checked against the filename before the
+// job ran, so we never derive a vm_name from envelope/header data; a replay
+// produces the same name we already know about.
 //
 // SINGLETON DEPLOYMENT REQUIRED — EXACTLY ONE CONSUMER PER SPOOL_DIR, AND
 // PER (account, set of allowed repos).
@@ -1306,9 +1308,11 @@ fn jit_blob_expired(md: &std::fs::Metadata, max_age_secs: u64) -> bool {
 
 /// Derive the expected vm_name for each cur/ file straight from its
 /// filename. The filename is `<workflow_job_id>.job`, and vm_name is a
-/// deterministic function of that id, so we don't need to read any bodies
-/// here. The supervisor validates the filename ↔ envelope id match before
-/// it ever lets a file get into cur/, so what's here is trustworthy.
+/// deterministic function of that id, so we don't need to read any bodies here.
+/// The supervisor cross-checks that id against the signed body in `prepare()`
+/// (after the claim) and finalizes a mismatch to error/; even so, deriving the
+/// name from a `u64` filename is safe on its own — GC only ever acts on it
+/// against VMs/runners that actually exist.
 async fn live_vm_names_from_cur(cur_dir: &Path) -> anyhow::Result<HashSet<String>> {
     Ok(live_vm_map_from_cur(cur_dir).await?.into_keys().collect())
 }
@@ -1325,10 +1329,10 @@ async fn live_vm_map_from_cur(cur_dir: &Path) -> anyhow::Result<HashMap<String, 
     // nothing this tick" rather than as an empty live set.
     let mut rd = tokio::fs::read_dir(cur_dir).await?;
     while let Some(ent) = rd.next_entry().await? {
-        // The filename alone identifies the claim and its vm_name (the
-        // supervisor validated the filename<->id match before the file entered
-        // cur/), so a name that doesn't parse as `<id>.job` is simply not a
-        // claim -> skip it, no stat needed.
+        // The filename alone identifies the claim and its vm_name (the id is
+        // cross-checked against the signed body in prepare(), after the claim;
+        // a mismatch is finalized to error/), so a name that doesn't parse as
+        // `<id>.job` is simply not a claim -> skip it, no stat needed.
         let name = ent.file_name();
         let Some(id) = name.to_str().and_then(parse_spool_filename) else {
             continue;
