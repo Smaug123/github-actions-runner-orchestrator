@@ -92,7 +92,10 @@ xml_escape() {
 prepare_paths() {
   if [ -z "${GHA_CACHE_DIR:-}" ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
     local home
-    home="$(dscl . -read "/Users/$SUDO_USER" NFSHomeDirectory 2>/dev/null | awk '{print $2}')"
+    # `dscl -read` prints `NFSHomeDirectory: /Users/foo`; strip the key label and
+    # keep the rest verbatim so a home directory containing spaces survives
+    # (awk '{print $2}' would truncate it at the first space).
+    home="$(dscl . -read "/Users/$SUDO_USER" NFSHomeDirectory 2>/dev/null | sed -n 's/^NFSHomeDirectory: //p')"
     [ -n "$home" ] && { GHA_CACHE_DIR="$home/.local/share/gha-mac-cache"; export GHA_CACHE_DIR; }
   fi
   if [ "$(id -u)" -eq 0 ] && [ -z "${GHA_CACHE_DIR:-}" ]; then

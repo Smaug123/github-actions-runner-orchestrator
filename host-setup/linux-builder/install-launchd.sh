@@ -59,10 +59,20 @@ fi
 install -m 0755 "$dir/start-builder.sh" "$BASE/start-builder.sh"
 
 # Render the plist. The only substitutions are absolute paths/label, which a
-# launchd plist cannot express portably itself.
-sed -e "s#__LABEL__#$LABEL#g" \
-    -e "s#__WRAPPER__#$BASE/start-builder.sh#g" \
-    -e "s#__BASE__#$BASE#g" \
+# launchd plist cannot express portably itself. Escape each replacement for sed:
+# a value containing the '#' delimiter, a literal '&' (which else expands to the
+# whole match), or a backslash would otherwise corrupt the output (a $HOME with
+# such a character is unusual but not impossible). Backslash is escaped first so
+# the backslashes we add for '&'/'#' aren't doubled.
+sed_repl_escape() {
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/&/\\&/g' -e 's/#/\\#/g'
+}
+label_esc="$(sed_repl_escape "$LABEL")"
+wrapper_esc="$(sed_repl_escape "$BASE/start-builder.sh")"
+base_esc="$(sed_repl_escape "$BASE")"
+sed -e "s#__LABEL__#$label_esc#g" \
+    -e "s#__WRAPPER__#$wrapper_esc#g" \
+    -e "s#__BASE__#$base_esc#g" \
     "$dir/launchd-agent.plist" > "$PLIST"
 plutil -lint "$PLIST"
 
