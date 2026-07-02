@@ -114,10 +114,9 @@ pub async fn run(rt: Runtime) -> Result<()> {
     crate::gc::sweep(&config, &gh, &lima).await;
 
     // The watcher owns the only Sender for `tx`. watch() loops forever in
-    // normal operation, so the dispatch loop below can exit via rx.recv()
-    // returning None ONLY when this task ends, i.e. only on failure. Keep the
-    // task's Result (don't swallow it) so describe_watcher_exit can surface the
-    // cause and fail the daemon loud instead of exiting 0.
+    // normal operation, so the task ending is always a failure. Keep its Result
+    // (don't swallow it) so supervise() can surface the cause and fail the
+    // daemon loud instead of exiting 0.
     let (tx, mut rx) = mpsc::channel::<String>(256);
     let watch_root = spool.new_dir();
     let watcher: JoinHandle<Result<()>> =
@@ -178,122 +177,158 @@ pub async fn run(rt: Runtime) -> Result<()> {
         });
     }
 
-    while let Some(name) = rx.recv().await {
-        // Acquire a permit while honoring pause. Two rules:
-        //
-        //  - Acquire the permit BEFORE claiming. The cur/ directory is ground
-        //    truth for in-flight jobs: GC ages cur/ entries from the claim's
-        //    mtime (gc.rs::expire_stale_cur) and JIT runners are minted assuming
-        //    the cur/ entry outlives the job. Claiming first then blocking for a
-        //    permit could let GC move the cur/ entry to error/ under us, leaving
-        //    a runner with no backing spool record. (If the channel backs up,
-        //    the watcher's periodic rescan replays surviving new/ entries.)
-        //
-        //  - Don't claim — or pin a permit — while paused, so a clean drain can
-        //    reach in_flight == 0. Re-check pause AFTER the (possibly long)
-        //    acquire, since it may flip while we wait for capacity; otherwise a
-        //    freed permit would let one more job through after pause.
-        let permit = loop {
-            // Returns immediately when not paused; errors only if pause_tx is
-            // dropped, which never happens while it lives in this scope.
-            let _ = pause_rx.wait_for(|paused| !*paused).await;
-            let permit = match Arc::clone(&permits).acquire_owned().await {
-                Ok(p) => p,
-                Err(_) => {
-                    // The semaphore is owned within this scope and never closed
-                    // in normal operation; if it is, the dispatch loop can't do
-                    // its job. Fail loud rather than falling through to a clean
-                    // exit (or hanging on the still-live watcher below).
-                    error!("semaphore closed; bailing out of dispatch");
-                    return Err(anyhow!("dispatch semaphore closed unexpectedly"));
+    // Run the dispatch loop, but race it against the watcher task. The watcher
+    // owns the channel's only Sender, so rx.recv() returning None already means
+    // the watcher died — but the receiver first drains every buffered filename,
+    // and this loop can block for a long time on pause/permit, so relying on the
+    // None alone would leave the daemon running watcher-less (and silent) until
+    // the buffer drains. supervise() instead surfaces the failure the instant
+    // the task ends, whatever dispatch is doing. Both futures finishing is
+    // abnormal, so it always returns Err.
+    let dispatch = async {
+        while let Some(name) = rx.recv().await {
+            // Acquire a permit while honoring pause. Two rules:
+            //
+            //  - Acquire the permit BEFORE claiming. The cur/ directory is ground
+            //    truth for in-flight jobs: GC ages cur/ entries from the claim's
+            //    mtime (gc.rs::expire_stale_cur) and JIT runners are minted assuming
+            //    the cur/ entry outlives the job. Claiming first then blocking for a
+            //    permit could let GC move the cur/ entry to error/ under us, leaving
+            //    a runner with no backing spool record. (If the channel backs up,
+            //    the watcher's periodic rescan replays surviving new/ entries.)
+            //
+            //  - Don't claim — or pin a permit — while paused, so a clean drain can
+            //    reach in_flight == 0. Re-check pause AFTER the (possibly long)
+            //    acquire, since it may flip while we wait for capacity; otherwise a
+            //    freed permit would let one more job through after pause.
+            let permit = loop {
+                // Returns immediately when not paused; errors only if pause_tx is
+                // dropped, which never happens while it lives in this scope.
+                let _ = pause_rx.wait_for(|paused| !*paused).await;
+                let permit = match Arc::clone(&permits).acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => {
+                        // The semaphore is owned within this scope and never closed
+                        // in normal operation; if it is, the dispatch loop can't do
+                        // its job. Fail loud rather than falling through to a clean
+                        // exit (or hanging on the still-live watcher below).
+                        error!("semaphore closed; bailing out of dispatch");
+                        return Err(anyhow!("dispatch semaphore closed unexpectedly"));
+                    }
+                };
+                if *pause_rx.borrow() {
+                    // Paused while we waited for capacity: release and re-wait so we
+                    // neither claim during pause nor pin a permit that would keep
+                    // in_flight above 0.
+                    drop(permit);
+                    continue;
                 }
+                break permit;
             };
-            if *pause_rx.borrow() {
-                // Paused while we waited for capacity: release and re-wait so we
-                // neither claim during pause nor pin a permit that would keep
-                // in_flight above 0.
-                drop(permit);
-                continue;
-            }
-            break permit;
-        };
-        match prepare(
-            &spool,
-            &name,
-            &config,
-            &webhook_secret,
-            &allowed_repos,
-            &runner_labels,
-        )
-        .await
-        {
-            Prepared::Run {
-                cur_path,
-                delivery,
-                event,
-            } => {
-                // delivery is the unauthenticated X-GitHub-Delivery from the
-                // envelope; workflow_job.name and repository.full_name are
-                // authenticated but author-controlled. Sanitize all three so
-                // a maliciously-named workflow or a forged envelope can't
-                // smuggle control characters into structured log output.
-                info!(
-                    vm = %crate::runner::vm_name_for_event(&event),
-                    delivery = %sanitize_for_log(&delivery),
-                    repo = %sanitize_for_log(&event.repository.full_name),
-                    job = %sanitize_for_log(&event.workflow_job.name),
-                    run_id = event.workflow_job.run_id,
-                    run_attempt = event.workflow_job.run_attempt,
-                    job_id = event.workflow_job.id,
-                    "claiming job"
-                );
-                // Best-effort signing-cache warm when this job is the live tip of
-                // its repo's default branch. Cheap + fire-and-forget: it spawns
-                // its own task and never blocks the dispatch loop or affects the
-                // job. `&event` is borrowed before `spawn_job` consumes it below.
-                if let Some(warmer) = &warmer {
-                    warmer.maybe_trigger(&event);
-                }
-                spawn_job(
-                    Arc::clone(&spool),
-                    Arc::clone(&config),
-                    Arc::clone(&gh),
-                    Arc::clone(&lima),
-                    event,
+            match prepare(
+                &spool,
+                &name,
+                &config,
+                &webhook_secret,
+                &allowed_repos,
+                &runner_labels,
+            )
+            .await
+            {
+                Prepared::Run {
                     cur_path,
-                    permit,
-                );
-            }
-            Prepared::Drop { cur_path, reason } => {
-                info!(file = %sanitize_for_log(&name), reason = %sanitize_for_log(&reason), "dropping (not for us)");
-                if let Err(e) = spool.finalize_done(&cur_path).await {
-                    warn!(error = %e, "finalize_done failed");
+                    delivery,
+                    event,
+                } => {
+                    // delivery is the unauthenticated X-GitHub-Delivery from the
+                    // envelope; workflow_job.name and repository.full_name are
+                    // authenticated but author-controlled. Sanitize all three so
+                    // a maliciously-named workflow or a forged envelope can't
+                    // smuggle control characters into structured log output.
+                    info!(
+                        vm = %crate::runner::vm_name_for_event(&event),
+                        delivery = %sanitize_for_log(&delivery),
+                        repo = %sanitize_for_log(&event.repository.full_name),
+                        job = %sanitize_for_log(&event.workflow_job.name),
+                        run_id = event.workflow_job.run_id,
+                        run_attempt = event.workflow_job.run_attempt,
+                        job_id = event.workflow_job.id,
+                        "claiming job"
+                    );
+                    // Best-effort signing-cache warm when this job is the live tip of
+                    // its repo's default branch. Cheap + fire-and-forget: it spawns
+                    // its own task and never blocks the dispatch loop or affects the
+                    // job. `&event` is borrowed before `spawn_job` consumes it below.
+                    if let Some(warmer) = &warmer {
+                        warmer.maybe_trigger(&event);
+                    }
+                    spawn_job(
+                        Arc::clone(&spool),
+                        Arc::clone(&config),
+                        Arc::clone(&gh),
+                        Arc::clone(&lima),
+                        event,
+                        cur_path,
+                        permit,
+                    );
                 }
-            }
-            Prepared::Reject { cur_path, reason } => {
-                warn!(file = %sanitize_for_log(&name), reason = %sanitize_for_log(&reason), "rejecting -> error/");
-                if let Err(e) = spool.finalize_error(&cur_path, &reason).await {
-                    warn!(error = %e, "finalize_error failed");
+                Prepared::Drop { cur_path, reason } => {
+                    info!(file = %sanitize_for_log(&name), reason = %sanitize_for_log(&reason), "dropping (not for us)");
+                    if let Err(e) = spool.finalize_done(&cur_path).await {
+                        warn!(error = %e, "finalize_done failed");
+                    }
                 }
+                Prepared::Reject { cur_path, reason } => {
+                    warn!(file = %sanitize_for_log(&name), reason = %sanitize_for_log(&reason), "rejecting -> error/");
+                    if let Err(e) = spool.finalize_error(&cur_path, &reason).await {
+                        warn!(error = %e, "finalize_error failed");
+                    }
+                }
+                Prepared::Skip => {}
             }
-            Prepared::Skip => {}
         }
-    }
+        Ok::<(), anyhow::Error>(())
+    };
 
-    // Reaching here means rx.recv() returned None: the watcher dropped the
-    // only Sender, which under normal operation never happens (watch() loops
-    // forever). So the watcher has already terminated abnormally. Surface its
-    // cause rather than returning Ok(()) — a clean exit here would return 0
-    // from main while the runtime teardown SIGKILLs every in-flight limactl
-    // shell without finalize.
-    Err(describe_watcher_exit(watcher).await)
+    supervise(dispatch, watcher).await
 }
 
-/// Translate a terminated spool-watcher task into the error the dispatch loop
-/// should fail with. Called only after the dispatch channel closed, so the
-/// task has already finished and awaiting it can't block.
-async fn describe_watcher_exit(watcher: JoinHandle<Result<()>>) -> anyhow::Error {
-    let err = match watcher.await {
+/// Race the dispatch loop against the spool-watcher task and translate whichever
+/// finishes into the daemon's exit status. Both finishing is abnormal:
+///
+///   * the watcher owns the channel's only Sender and watch() loops forever, so
+///     the watcher task ending is always a failure;
+///   * the dispatch future only completes on the semaphore-closed bail-out (its
+///     Err) or when the channel closes (its Ok — which itself means the watcher
+///     died and dropped the Sender).
+///
+/// So the result is always Err. Biased toward the watcher so its death is
+/// reported the instant it happens — even while dispatch is draining buffered
+/// filenames or blocked on pause/permit — rather than only once the buffer
+/// drains. Because the watcher is polled first, reaching the dispatch `Ok(())`
+/// arm means the watcher was Pending there, so re-awaiting the handle is sound.
+async fn supervise(
+    dispatch: impl std::future::Future<Output = Result<()>>,
+    mut watcher: JoinHandle<Result<()>>,
+) -> Result<()> {
+    tokio::pin!(dispatch);
+    tokio::select! {
+        biased;
+        res = &mut watcher => Err(describe_watcher_result(res)),
+        r = &mut dispatch => match r {
+            Err(e) => Err(e),
+            Ok(()) => Err(describe_watcher_result(watcher.await)),
+        },
+    }
+}
+
+/// Translate a joined spool-watcher task into the error the daemon fails with,
+/// logging it so the failure is visible immediately rather than only via main's
+/// propagation.
+fn describe_watcher_result(
+    res: std::result::Result<Result<()>, tokio::task::JoinError>,
+) -> anyhow::Error {
+    let err = match res {
         // watch() returned Ok — only possible if its internal event channel
         // closed under it. Still abnormal: the dispatcher has no source of work.
         Ok(Ok(())) => anyhow!("spool watcher exited without error but its channel closed"),
@@ -1057,10 +1092,10 @@ mod tests {
     #[tokio::test]
     async fn watcher_exit_ok_is_still_an_error() {
         // watch() returning Ok means its event channel closed under it; the
-        // dispatch loop only reaches describe_watcher_exit on an abnormal
-        // termination, so even Ok must become an error (never exit 0).
+        // supervisor only inspects the watcher on an abnormal termination, so
+        // even Ok must become an error (never exit 0).
         let h: JoinHandle<Result<()>> = tokio::spawn(async { Ok(()) });
-        let e = describe_watcher_exit(h).await;
+        let e = describe_watcher_result(h.await);
         assert!(
             e.to_string().contains("channel closed"),
             "unexpected error: {e:#}"
@@ -1070,7 +1105,7 @@ mod tests {
     #[tokio::test]
     async fn watcher_exit_err_propagates_cause() {
         let h: JoinHandle<Result<()>> = tokio::spawn(async { Err(anyhow!("enumerate boom")) });
-        let e = describe_watcher_exit(h).await;
+        let e = describe_watcher_result(h.await);
         let chain = format!("{e:#}");
         assert!(chain.contains("spool watcher failed"), "chain: {chain}");
         assert!(chain.contains("enumerate boom"), "chain: {chain}");
@@ -1084,9 +1119,56 @@ mod tests {
             }
             Ok(())
         });
-        let e = describe_watcher_exit(h).await;
+        let e = describe_watcher_result(h.await);
         assert!(
             e.to_string().contains("panicked"),
+            "unexpected error: {e:#}"
+        );
+    }
+
+    // supervise() must report watcher death promptly even when the dispatch
+    // future is still busy — this is the fail-fast property Codex flagged: a
+    // watcher that dies with buffered work (or while dispatch is blocked on
+    // pause/permit) must not be masked until dispatch drains.
+    #[tokio::test]
+    async fn supervise_surfaces_watcher_death_over_busy_dispatch() {
+        // Dispatch never completes on its own, standing in for a loop blocked
+        // on pause/permit or draining a backlog.
+        let dispatch = std::future::pending::<Result<()>>();
+        let watcher: JoinHandle<Result<()>> =
+            tokio::spawn(async { Err(anyhow!("watch setup boom")) });
+        let r = supervise(dispatch, watcher).await;
+        let e = r.expect_err("supervise must fail when the watcher dies");
+        let chain = format!("{e:#}");
+        assert!(chain.contains("spool watcher failed"), "chain: {chain}");
+        assert!(chain.contains("watch setup boom"), "chain: {chain}");
+    }
+
+    #[tokio::test]
+    async fn supervise_propagates_dispatch_error() {
+        // The semaphore-closed bail-out: dispatch returns Err while the watcher
+        // is still alive. supervise must surface the dispatch error, not hang on
+        // the live watcher.
+        let dispatch = async { Err(anyhow!("dispatch semaphore closed unexpectedly")) };
+        let watcher: JoinHandle<Result<()>> = tokio::spawn(std::future::pending());
+        let r = supervise(dispatch, watcher).await;
+        let e = r.expect_err("dispatch error must propagate");
+        assert!(
+            e.to_string().contains("semaphore closed"),
+            "unexpected error: {e:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn supervise_channel_close_recovers_watcher_cause() {
+        // Dispatch returns Ok(()) (channel closed); supervise must still fail,
+        // recovering the watcher's cause rather than exiting 0.
+        let dispatch = async { Ok(()) };
+        let watcher: JoinHandle<Result<()>> = tokio::spawn(async { Err(anyhow!("late boom")) });
+        let r = supervise(dispatch, watcher).await;
+        let e = r.expect_err("channel close must not become a clean exit");
+        assert!(
+            format!("{e:#}").contains("late boom"),
             "unexpected error: {e:#}"
         );
     }
