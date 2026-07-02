@@ -565,6 +565,7 @@ pub(crate) fn classify_validated_entry(
 }
 
 /// Verdict of the shared label policy.
+#[derive(Debug)]
 pub(crate) enum LabelVerdict {
     Accept,
     /// Not for us: the gate label is missing, or a requested label is outside
@@ -577,15 +578,26 @@ pub(crate) enum LabelVerdict {
 /// the advertised set. Pulling it out of `prepare()` keeps the policy in one
 /// place even though the reconciler validates authenticated API data rather
 /// than spool data (so it legitimately does not route through `prepare()`).
+///
+/// Matching is ASCII case-insensitive, because GitHub matches runner labels
+/// case-insensitively: a workflow written `runs-on: [Self-Hosted, Lima-Nix]`
+/// queues on our runners on GitHub's side, so a case-sensitive check here would
+/// reject a job GitHub considers ours and strand it until GitHub's 24h timeout —
+/// the reconciler, sharing this policy, would skip it too. Runner labels are
+/// ASCII, so `eq_ignore_ascii_case` matches GitHub's normalization without an
+/// allocation.
 pub(crate) fn classify_job_labels(
     labels: &[String],
     runner_label: &str,
     runner_labels: &HashSet<String>,
 ) -> LabelVerdict {
-    if !labels.iter().any(|l| l == runner_label) {
+    if !labels.iter().any(|l| l.eq_ignore_ascii_case(runner_label)) {
         return LabelVerdict::Reject(format!("labels {labels:?} do not include {runner_label}"));
     }
-    if let Some(unknown) = labels.iter().find(|l| !runner_labels.contains(l.as_str())) {
+    if let Some(unknown) = labels
+        .iter()
+        .find(|l| !runner_labels.iter().any(|a| a.eq_ignore_ascii_case(l)))
+    {
         return LabelVerdict::Reject(format!("label {unknown:?} not in advertised set"));
     }
     LabelVerdict::Accept
@@ -1115,6 +1127,42 @@ mod tests {
             &test_labels(),
         );
         assert!(matches!(v, LabelVerdict::Reject(ref r) if r.contains("prod")));
+    }
+
+    // GitHub matches runner labels case-insensitively, so a workflow written
+    // `runs-on: [Self-Hosted, Lima-Nix]` queues on our runners and must be
+    // accepted, not stranded until GitHub's 24h timeout.
+    #[test]
+    fn classify_job_labels_accepts_differently_cased_gate_and_labels() {
+        let v = classify_job_labels(
+            &["Self-Hosted".into(), "Lima-Nix".into()],
+            "lima-nix",
+            &test_labels(),
+        );
+        assert!(matches!(v, LabelVerdict::Accept), "got {v:?}");
+    }
+
+    #[test]
+    fn classify_job_labels_gate_match_is_case_insensitive() {
+        // Gate present only in a different case.
+        let v = classify_job_labels(
+            &["self-hosted".into(), "LIMA-NIX".into()],
+            "lima-nix",
+            &test_labels(),
+        );
+        assert!(matches!(v, LabelVerdict::Accept), "got {v:?}");
+    }
+
+    // Case-insensitivity must not weaken the subset check: a genuinely unknown
+    // label is still rejected regardless of case.
+    #[test]
+    fn classify_job_labels_still_drops_unknown_label_any_case() {
+        let v = classify_job_labels(
+            &["self-hosted".into(), "lima-nix".into(), "Prod".into()],
+            "lima-nix",
+            &test_labels(),
+        );
+        assert!(matches!(v, LabelVerdict::Reject(ref r) if r.to_lowercase().contains("prod")));
     }
 
     #[test]
