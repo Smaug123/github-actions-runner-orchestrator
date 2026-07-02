@@ -799,6 +799,23 @@ mod tests {
         assert!(s.try_claim("nope.job").await.unwrap().is_none());
     }
 
+    /// A startup failure in `watch` (here: the watched dir doesn't exist) must
+    /// surface as an `Err` rather than looping or hanging. The supervisor
+    /// relies on this: the returned error is what lets it fail loud instead of
+    /// exiting 0 with jobs in flight.
+    #[tokio::test]
+    async fn watch_fails_fast_when_root_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        // Deliberately do not create this subdirectory.
+        let missing = dir.path().join("new");
+        let (tx, _rx) = mpsc::channel::<String>(8);
+        let r = watch(missing, tx).await;
+        assert!(
+            r.is_err(),
+            "expected watch to fail when its root is missing"
+        );
+    }
+
     #[tokio::test]
     async fn finalize_error_writes_sidecar_and_moves_file() {
         let (_dir, root) = spool_tmp().await;
