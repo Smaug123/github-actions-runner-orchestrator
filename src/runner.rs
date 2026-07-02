@@ -318,6 +318,44 @@ fn dispatch_verdict(obs: RunnerObs, elapsed: Duration, deadline: Duration) -> Di
     }
 }
 
+/// What the confirmation layer does with a single-observation `DispatchVerdict`,
+/// given whether the previous tick already wanted to abort.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConfirmAction {
+    /// Leave the pending state unchanged.
+    Hold,
+    /// First abort verdict — re-poll once before reaping (arm the confirmation).
+    WaitToConfirm(&'static str),
+    /// A second abort verdict with a pending confirmation — reap now.
+    Abort(&'static str),
+}
+
+/// Require a *confirming* abort verdict before reaping: the first abort arms the
+/// confirmation, a later abort with none intervening reaps.
+///
+/// A runner can be handed a job in the poll grid right at the deadline boundary
+/// and still read as `idle` (or briefly `offline`) on the next poll before
+/// GitHub reflects `busy`. Reaping on a single abort verdict there would kill a
+/// runner that is about to run its job — failing that job permanently, since it
+/// has left the queue and the reconciler won't re-mint. A confirming poll
+/// shrinks that to the far smaller chance of two boundary misses.
+///
+/// A non-abort verdict HOLDS the pending confirmation rather than clearing it. A
+/// failed poll (`Unknown`, mapped to `Continue`) is not evidence the runner
+/// recovered, so clearing on it would let API blips alternating with `idle`/
+/// `gone` stave off reaping indefinitely, well past the deadline. There is no
+/// verdict here that clears a pending abort: genuine recovery is the runner
+/// going `busy`, which parks the watchdog *before* this function is reached, and
+/// elapsed time is monotonic so a within-deadline read can't follow a
+/// post-deadline abort. So `pending` only ever goes unset -> set -> reap.
+fn confirm_abort(pending: bool, verdict: DispatchVerdict) -> ConfirmAction {
+    match verdict {
+        DispatchVerdict::Abort(reason) if pending => ConfirmAction::Abort(reason),
+        DispatchVerdict::Abort(reason) => ConfirmAction::WaitToConfirm(reason),
+        DispatchVerdict::Continue => ConfirmAction::Hold,
+    }
+}
+
 /// Map a single `runner_status` call to a poll observation. A failed call is
 /// `Unknown`, not `Gone`: a transient API blip must not be read as a lost
 /// registration.
@@ -334,14 +372,16 @@ async fn observe_runner(gh: &GhClient, owner: &str, repo: &str, runner_id: u64) 
     }
 }
 
-/// Poll the minted runner until it is wedged, returning a human-readable reason.
+/// Poll the minted runner until it is *confirmed* wedged, returning a
+/// human-readable reason.
 ///
-/// Resolves **only** when `dispatch_verdict` says to abort; on a healthy run it
-/// never returns, so the `select!` in `run_in_vm` is decided by `gha-run-once`
-/// exiting instead. The returned reason is spliced into the job's error and
-/// drives the caller's teardown, which stops+deletes the VM (killing the wedged
-/// runner) and deregisters it; the reconciler re-mints only if the job is still
-/// queued on GitHub (a cancelled/stolen one is not, so there is no churn).
+/// Resolves **only** after two consecutive abort verdicts (see `confirm_abort`);
+/// on a healthy run it never returns, so the `select!` in `run_in_vm` is decided
+/// by `gha-run-once` exiting instead. The returned reason is spliced into the
+/// job's error and drives the caller's teardown, which stops+deletes the VM
+/// (killing the wedged runner) and deregisters it; the reconciler re-mints only
+/// if the job is still queued on GitHub (a cancelled/stolen one is not, so there
+/// is no churn).
 async fn watch_dispatch(
     gh: &GhClient,
     owner: &str,
@@ -355,6 +395,7 @@ async fn watch_dispatch(
     let mut ticker = tokio::time::interval(poll);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     ticker.tick().await; // the first tick fires immediately; nothing to observe yet
+    let mut pending = false;
     loop {
         ticker.tick().await;
         let obs = observe_runner(gh, owner, repo, runner_id).await;
@@ -362,19 +403,35 @@ async fn watch_dispatch(
             // The runner picked up a job: it can never be wedged now, and the
             // 6h JOB_MAX_RUNTIME_SECS ceiling takes over. Park forever (no more
             // polling) so the select! in run_in_vm is resolved only by
-            // gha-run-once exiting.
+            // gha-run-once exiting. (Reaching here after a pending abort is
+            // exactly the boundary case the confirming poll protects.)
             std::future::pending::<()>().await;
         }
         let elapsed = start.elapsed();
-        if let DispatchVerdict::Abort(reason) = dispatch_verdict(obs, elapsed, deadline) {
-            warn!(
-                vm,
-                runner_id,
-                elapsed_secs = elapsed.as_secs(),
-                observation = ?obs,
-                "dispatch watchdog: runner never started a job; reaping its VM ({reason})"
-            );
-            return reason.to_string();
+        match confirm_abort(pending, dispatch_verdict(obs, elapsed, deadline)) {
+            ConfirmAction::Abort(reason) => {
+                warn!(
+                    vm,
+                    runner_id,
+                    elapsed_secs = elapsed.as_secs(),
+                    observation = ?obs,
+                    "dispatch watchdog: runner never started a job (confirmed); reaping its VM ({reason})"
+                );
+                return reason.to_string();
+            }
+            ConfirmAction::WaitToConfirm(reason) => {
+                pending = true;
+                warn!(
+                    vm,
+                    runner_id,
+                    elapsed_secs = elapsed.as_secs(),
+                    observation = ?obs,
+                    "dispatch watchdog: runner looks wedged ({reason}); re-polling to confirm before reaping"
+                );
+            }
+            // Hold: leave `pending` unchanged. A failed poll (Unknown) is not
+            // evidence of recovery, so it must not clear an armed confirmation.
+            ConfirmAction::Hold => {}
         }
     }
 }
@@ -697,5 +754,61 @@ mod tests {
             dispatch_verdict(RunnerObs::Unknown, Duration::from_secs(10_000), d),
             DispatchVerdict::Continue
         );
+    }
+
+    #[test]
+    fn confirm_abort_arms_then_reaps_and_holds_across_non_abort() {
+        // First abort verdict only arms the confirmation.
+        assert_eq!(
+            confirm_abort(false, DispatchVerdict::Abort("x")),
+            ConfirmAction::WaitToConfirm("x")
+        );
+        // A later abort with a pending confirmation reaps.
+        assert_eq!(
+            confirm_abort(true, DispatchVerdict::Abort("x")),
+            ConfirmAction::Abort("x")
+        );
+        // A non-abort verdict HOLDS the pending state (does not clear it): a
+        // failed poll is not evidence the runner recovered.
+        assert_eq!(
+            confirm_abort(true, DispatchVerdict::Continue),
+            ConfirmAction::Hold
+        );
+        assert_eq!(
+            confirm_abort(false, DispatchVerdict::Continue),
+            ConfirmAction::Hold
+        );
+    }
+
+    /// Thread `pending` through `confirm_abort` for a verdict sequence, returning
+    /// the 1-based tick index it would reap on (or None). Models watch_dispatch's
+    /// loop (minus the Busy park, which never reaches confirm_abort — so a
+    /// recovered runner is modeled by the sequence simply ending).
+    fn abort_tick(verdicts: &[DispatchVerdict]) -> Option<usize> {
+        let mut pending = false;
+        for (i, &v) in verdicts.iter().enumerate() {
+            match confirm_abort(pending, v) {
+                ConfirmAction::Abort(_) => return Some(i + 1),
+                ConfirmAction::WaitToConfirm(_) => pending = true,
+                ConfirmAction::Hold => {} // pending unchanged
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn confirm_abort_boundary_recovery_and_reap_sequences() {
+        use DispatchVerdict::{Abort, Continue};
+        // A single wedged read then recovery (runner goes busy -> parks, so no
+        // further confirm_abort call): the lone armed confirmation never reaps.
+        assert_eq!(abort_tick(&[Abort("a")]), None);
+        // Two wedged reads reap on the second.
+        assert_eq!(abort_tick(&[Abort("a"), Abort("a")]), Some(2));
+        // A failed poll (Continue, e.g. Unknown) between two aborts must NOT
+        // clear the confirmation, so the second real abort still reaps — the
+        // alternating-blip case that a naive reset broke.
+        assert_eq!(abort_tick(&[Abort("a"), Continue, Abort("a")]), Some(3));
+        // Sustained wedge reaps on the second tick, not the first.
+        assert_eq!(abort_tick(&[Abort("a"), Abort("a"), Abort("a")]), Some(2));
     }
 }
