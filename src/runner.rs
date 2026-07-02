@@ -445,14 +445,31 @@ pub fn vm_name(job_id: u64) -> String {
     format!("gha-{job_id:016x}")
 }
 
+/// Write the single-use JIT config to `path` owner-only (0600), replacing any
+/// stale blob a previous (crashed) attempt for this job id left behind.
+///
+/// We unlink then `create_new` with `O_NOFOLLOW | O_NONBLOCK` (rather than
+/// truncating in place): `.mode()` only applies on creation, so an existing
+/// symlink/FIFO or lax-perms file would otherwise be followed, truncated, or
+/// block us. Replacing a stale blob — instead of failing on it, as a bare
+/// `create_new` would — matters because VM names are job-id-derived: when the
+/// reconciler re-runs a job whose previous attempt crashed before teardown
+/// unlinked the blob, a create_new here would fail and burn a spurious
+/// mint->error->re-mint cycle. The unlink races nobody: the cur/ claim is
+/// exclusive per job id, so only one worker writes a given path at a time, and
+/// `state_dir/instances` is 0700 ours (ensure_paths), born owner-only.
 async fn write_jit_blob(path: &std::path::Path, contents: &[u8]) -> Result<()> {
-    // create_new(true) + mode(0o600) ensures we never write through an
-    // existing file with permissive perms, and the file is born owner-only.
-    // A stale file from a previous (crashed) attempt is itself a smell — the
-    // caller should have either reused that VM or let teardown unlink it.
+    match fs::remove_file(path).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(e).with_context(|| format!("remove stale JIT blob {}", path.display()))
+        }
+    }
     let mut f = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .mode(0o600)
         .open(path)
         .await?;
@@ -477,18 +494,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn jit_blob_refuses_to_clobber_existing_file() {
+    async fn jit_blob_replaces_stale_blob_from_a_crashed_attempt() {
+        // A crash can leave last attempt's blob; the reconciler re-running the
+        // same job id must overwrite it (owner-only), not fail on it.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("blob.jit");
         std::fs::write(&path, b"stale").unwrap();
-        let err = write_jit_blob(&path, b"new").await.unwrap_err();
-        assert!(
-            err.to_string().to_lowercase().contains("exists")
-                || err
-                    .downcast_ref::<std::io::Error>()
-                    .map(|e| e.kind() == std::io::ErrorKind::AlreadyExists)
-                    .unwrap_or(false)
-        );
+        write_jit_blob(&path, b"new").await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+    }
+
+    #[tokio::test]
+    async fn jit_blob_replaces_symlink_without_clobbering_target() {
+        // A hostile/stale symlink at the blob path must be replaced with a fresh
+        // 0600 regular file (O_NOFOLLOW), leaving whatever it pointed at intact.
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("secret");
+        std::fs::write(&secret, b"untouched").unwrap();
+        let path = dir.path().join("blob.jit");
+        std::os::unix::fs::symlink(&secret, &path).unwrap();
+
+        write_jit_blob(&path, b"new").await.unwrap();
+
+        assert_eq!(std::fs::read(&secret).unwrap(), b"untouched");
+        let md = std::fs::symlink_metadata(&path).unwrap();
+        assert!(md.file_type().is_file(), "blob must be a regular file now");
+        assert_eq!(md.mode() & 0o777, 0o600);
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
     }
 
     #[tokio::test]
