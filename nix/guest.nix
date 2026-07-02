@@ -208,9 +208,17 @@ in
     description = "Lima guest agent";
     wantedBy = [ "multi-user.target" ];
     after = [ "cloud-final.service" ];
+    # The agent is essential — without it Lima can't talk to the guest — and it
+    # legitimately fails a few times early in boot (it needs /mnt/lima-cidata,
+    # mounted by cloud-final). With the default 100ms RestartSec it would hit
+    # systemd's default start-rate limit (5 starts / 10s) and give up for good if
+    # cloud-final is slow, leaving the VM unreachable. Disable the rate limit so
+    # it retries indefinitely, and space retries out so it isn't a busy-loop.
+    unitConfig.StartLimitIntervalSec = 0;
     serviceConfig = {
       Type = "simple";
       Restart = "on-failure";
+      RestartSec = 2;
       ExecStart = pkgs.writeShellScript "lima-guestagent-daemon" ''
         set -a
         . /mnt/lima-cidata/lima.env

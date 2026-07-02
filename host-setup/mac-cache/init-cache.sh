@@ -132,9 +132,14 @@ mv -f "$tmp_pub" "$public_key"
 #
 # Written via temp+rename, not `>`: a pre-existing symlink here (e.g. a restore
 # pointing at the secret key) would otherwise redirect the write and clobber
-# its target. rename replaces the link itself rather than following it. The
-# temp lives in the docroot, but holds only this non-secret content.
-tmp_info="$(mktemp "$cache_dir/.nix-cache-info.XXXXXX")"
+# its target. rename replaces the link itself rather than following it.
+#
+# The temp is staged UNDER $base, not in the docroot ($cache_dir): mktemp creates
+# it 0600, and an interrupt between mktemp and the chmod 644 below would leave a
+# non-world-readable file in the served tree, which serve-cache.sh's perm gate
+# then refuses to start over — permanently, until hand-cleaned. $base is the same
+# filesystem as the docroot, so the final `mv` is still an atomic rename.
+tmp_info="$(mktemp "$base/.nix-cache-info.XXXXXX")"
 cat > "$tmp_info" <<'EOF'
 StoreDir: /nix/store
 WantMassQuery: 1
