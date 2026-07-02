@@ -122,7 +122,10 @@ pub async fn run(rt: Runtime) -> Result<()> {
     let watcher: JoinHandle<Result<()>> =
         tokio::spawn(async move { crate::spool::watch(watch_root, tx).await });
 
-    {
+    // GC sweep loop. It runs forever, so its handle resolving means a panic in a
+    // sweep — which would otherwise silently leave the daemon with no GC (VMs and
+    // stale cur/ claims leak). supervise() watches the handle and fails loud.
+    let gc: JoinHandle<()> = {
         let config = Arc::clone(&config);
         let gh = Arc::clone(&gh);
         let lima = Arc::clone(&lima);
@@ -134,8 +137,8 @@ pub async fn run(rt: Runtime) -> Result<()> {
                 t.tick().await;
                 crate::gc::sweep(&config, &gh, &lima).await;
             }
-        });
-    }
+        })
+    };
 
     // Queued-job reconciler: the correctness backstop. GitHub's runner matching
     // is label-fungible, so a runner we mint for one job can be handed an
@@ -143,7 +146,11 @@ pub async fn run(rt: Runtime) -> Result<()> {
     // queue for any still-queued job that lacks a runner. Separate (faster)
     // cadence from GC so a stolen job recovers promptly without running VM
     // cleanup every minute. Skips while paused so a clean drain still works.
-    if config.reconcile_enabled {
+    // Like GC, this loop runs forever; supervise() watches its handle so a panic
+    // in a reconcile pass fails the daemon loud instead of silently disabling the
+    // correctness backstop (validate() even refuses to start with the reconciler
+    // off, so it running-but-dead would be worse than a clean refusal).
+    let reconciler: Option<JoinHandle<()>> = if config.reconcile_enabled {
         let config = Arc::clone(&config);
         let gh = Arc::clone(&gh);
         let lima = Arc::clone(&lima);
@@ -152,7 +159,7 @@ pub async fn run(rt: Runtime) -> Result<()> {
         let webhook_secret = Arc::clone(&webhook_secret);
         let runner_labels = Arc::clone(&runner_labels);
         let pause_rx = pause_tx.subscribe();
-        tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             let mut t = tokio::time::interval(Duration::from_secs(config.reconcile_interval_secs));
             t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
@@ -174,8 +181,10 @@ pub async fn run(rt: Runtime) -> Result<()> {
                 )
                 .await;
             }
-        });
-    }
+        }))
+    } else {
+        None
+    };
 
     // Run the dispatch loop, but race it against the watcher task. The watcher
     // owns the channel's only Sender, so rx.recv() returning None already means
@@ -290,31 +299,50 @@ pub async fn run(rt: Runtime) -> Result<()> {
         Ok::<(), anyhow::Error>(())
     };
 
-    supervise(dispatch, watcher).await
+    supervise(dispatch, watcher, gc, reconciler).await
 }
 
-/// Race the dispatch loop against the spool-watcher task and translate whichever
-/// finishes into the daemon's exit status. Both finishing is abnormal:
+/// Race the dispatch loop against every long-lived supervisory task and translate
+/// whichever finishes into the daemon's exit status. Any of them finishing is
+/// abnormal, so the result is always Err:
 ///
 ///   * the watcher owns the channel's only Sender and watch() loops forever, so
 ///     the watcher task ending is always a failure;
+///   * the GC and reconciler loops run forever, so their handles resolving means
+///     a panic (or unexpected exit) — which would otherwise silently leave the
+///     daemon with no GC / no reconciliation while it keeps dispatching;
 ///   * the dispatch future only completes on the semaphore-closed bail-out (its
 ///     Err) or when the channel closes (its Ok — which itself means the watcher
 ///     died and dropped the Sender).
 ///
-/// So the result is always Err. Biased toward the watcher so its death is
-/// reported the instant it happens — even while dispatch is draining buffered
-/// filenames or blocked on pause/permit — rather than only once the buffer
-/// drains. Because the watcher is polled first, reaching the dispatch `Ok(())`
-/// arm means the watcher was Pending there, so re-awaiting the handle is sound.
+/// Biased toward the supervisory tasks so a death is reported the instant it
+/// happens — even while dispatch is draining buffered filenames or blocked on
+/// pause/permit. Because the watcher is polled before the dispatch arm, reaching
+/// the dispatch `Ok(())` arm means the watcher was Pending there, so re-awaiting
+/// the handle is sound.
 async fn supervise(
     dispatch: impl std::future::Future<Output = Result<()>>,
     mut watcher: JoinHandle<Result<()>>,
+    gc: JoinHandle<()>,
+    reconciler: Option<JoinHandle<()>>,
 ) -> Result<()> {
     tokio::pin!(dispatch);
+    let gc_death = forever_task_death("gc", gc);
+    tokio::pin!(gc_death);
+    // A never-resolving stand-in when the reconciler is disabled, so the select
+    // has a fixed shape either way.
+    let reconciler_death = async move {
+        match reconciler {
+            Some(h) => forever_task_death("reconciler", h).await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(reconciler_death);
     tokio::select! {
         biased;
         res = &mut watcher => Err(describe_watcher_result(res)),
+        e = &mut gc_death => Err(e),
+        e = &mut reconciler_death => Err(e),
         r = &mut dispatch => match r {
             Err(e) => Err(e),
             Ok(()) => Err(describe_watcher_result(watcher.await)),
@@ -336,6 +364,19 @@ fn describe_watcher_result(
         Err(e) => anyhow::Error::new(e).context("spool watcher task panicked"),
     };
     error!(error = %format!("{err:#}"), "dispatch loop lost its spool watcher; failing");
+    err
+}
+
+/// Await a task that is supposed to run for the daemon's whole life and turn its
+/// termination into the error to fail with. Reaching here at all is abnormal: the
+/// task returned (unexpected) or panicked. Logs so the cause is visible promptly.
+async fn forever_task_death(name: &'static str, handle: JoinHandle<()>) -> anyhow::Error {
+    let err = match handle.await {
+        Ok(()) => anyhow!("{name} task exited unexpectedly"),
+        Err(e) if e.is_panic() => anyhow::Error::new(e).context(format!("{name} task panicked")),
+        Err(e) => anyhow::Error::new(e).context(format!("{name} task ended")),
+    };
+    error!(error = %format!("{err:#}"), task = name, "supervised background task died; failing");
     err
 }
 
@@ -1137,7 +1178,7 @@ mod tests {
         let dispatch = std::future::pending::<Result<()>>();
         let watcher: JoinHandle<Result<()>> =
             tokio::spawn(async { Err(anyhow!("watch setup boom")) });
-        let r = supervise(dispatch, watcher).await;
+        let r = supervise(dispatch, watcher, never_task(), None).await;
         let e = r.expect_err("supervise must fail when the watcher dies");
         let chain = format!("{e:#}");
         assert!(chain.contains("spool watcher failed"), "chain: {chain}");
@@ -1151,7 +1192,7 @@ mod tests {
         // the live watcher.
         let dispatch = async { Err(anyhow!("dispatch semaphore closed unexpectedly")) };
         let watcher: JoinHandle<Result<()>> = tokio::spawn(std::future::pending());
-        let r = supervise(dispatch, watcher).await;
+        let r = supervise(dispatch, watcher, never_task(), None).await;
         let e = r.expect_err("dispatch error must propagate");
         assert!(
             e.to_string().contains("semaphore closed"),
@@ -1165,10 +1206,86 @@ mod tests {
         // recovering the watcher's cause rather than exiting 0.
         let dispatch = async { Ok(()) };
         let watcher: JoinHandle<Result<()>> = tokio::spawn(async { Err(anyhow!("late boom")) });
-        let r = supervise(dispatch, watcher).await;
+        let r = supervise(dispatch, watcher, never_task(), None).await;
         let e = r.expect_err("channel close must not become a clean exit");
         assert!(
             format!("{e:#}").contains("late boom"),
+            "unexpected error: {e:#}"
+        );
+    }
+
+    /// A JoinHandle for a task that never finishes — a healthy long-lived task.
+    fn never_task() -> JoinHandle<()> {
+        tokio::spawn(std::future::pending())
+    }
+
+    #[tokio::test]
+    async fn forever_task_death_reports_panic() {
+        let h: JoinHandle<()> = tokio::spawn(async {
+            if true {
+                panic!("sweep boom");
+            }
+        });
+        let e = forever_task_death("gc", h).await;
+        let chain = format!("{e:#}");
+        assert!(chain.contains("gc task panicked"), "chain: {chain}");
+    }
+
+    #[tokio::test]
+    async fn forever_task_death_reports_unexpected_exit() {
+        let h: JoinHandle<()> = tokio::spawn(async {});
+        let e = forever_task_death("reconciler", h).await;
+        assert!(
+            e.to_string()
+                .contains("reconciler task exited unexpectedly"),
+            "unexpected error: {e:#}"
+        );
+    }
+
+    // A GC panic must fail the daemon even while dispatch is healthy (pending) and
+    // the watcher is alive — otherwise the daemon runs on with no GC.
+    #[tokio::test]
+    async fn supervise_surfaces_gc_death() {
+        let dispatch = std::future::pending::<Result<()>>();
+        let watcher: JoinHandle<Result<()>> = tokio::spawn(std::future::pending());
+        let gc: JoinHandle<()> = tokio::spawn(async {
+            if true {
+                panic!("gc boom");
+            }
+        });
+        let r = supervise(dispatch, watcher, gc, None).await;
+        let e = r.expect_err("supervise must fail when GC dies");
+        assert!(format!("{e:#}").contains("gc task panicked"), "err: {e:#}");
+    }
+
+    // Same for the reconciler when it is enabled.
+    #[tokio::test]
+    async fn supervise_surfaces_reconciler_death() {
+        let dispatch = std::future::pending::<Result<()>>();
+        let watcher: JoinHandle<Result<()>> = tokio::spawn(std::future::pending());
+        let reconciler: JoinHandle<()> = tokio::spawn(async {
+            if true {
+                panic!("reconcile boom");
+            }
+        });
+        let r = supervise(dispatch, watcher, never_task(), Some(reconciler)).await;
+        let e = r.expect_err("supervise must fail when the reconciler dies");
+        assert!(
+            format!("{e:#}").contains("reconciler task panicked"),
+            "err: {e:#}"
+        );
+    }
+
+    // A disabled reconciler (None) must not be treated as a death: with all other
+    // tasks healthy, supervise stays pending until dispatch resolves.
+    #[tokio::test]
+    async fn supervise_none_reconciler_is_not_a_death() {
+        let dispatch = async { Err(anyhow!("dispatch semaphore closed unexpectedly")) };
+        let watcher: JoinHandle<Result<()>> = tokio::spawn(std::future::pending());
+        let r = supervise(dispatch, watcher, never_task(), None).await;
+        let e = r.expect_err("dispatch error must propagate");
+        assert!(
+            e.to_string().contains("semaphore closed"),
             "unexpected error: {e:#}"
         );
     }
