@@ -82,18 +82,24 @@ Not in scope yet. When we ship, we'll want:
 - Probably packaged as a single `nix run`-installable that drops both
   plists with paths derived from the flake.
 
-## Graceful shutdown
+## Graceful shutdown (partially done)
 
-On SIGINT today we exit immediately. In-flight VMs survive the daemon's
-death because Lima processes are independent; on the next start the GC
-sweep reaps them and the cur/ stale-claim logic re-routes their spool
-files to error/. That's correct but wasteful (we throw away ~minutes of
-work per VM). A nicer story:
+SIGTERM, or the first Ctrl+C, now pauses new claims and waits for in-flight
+VMs to drain before exiting cleanly; a second Ctrl+C forces immediate teardown
+(see `supervisor::run_shutdown`). On a forced teardown the in-flight VMs
+survive the daemon's death — Lima processes are independent — and the next
+start's GC sweep reaps them, with the cur/ stale-claim logic re-routing their
+spool files to error/. What's still deferred:
 
-- On SIGINT, stop accepting new claims, wait up to N seconds for in-flight
-  jobs to finish their normal teardown, then force-stop the rest.
-- Per-job state machine should be checkpoint-able so a longer drain
-  doesn't fight a SIGTERM from launchd.
+- **No drain deadline.** A wedged job is bounded only by `JOB_MAX_RUNTIME_SECS`
+  (its watchdog) and, from outside, by the operator's second Ctrl+C or the
+  service manager's SIGKILL timeout. A bounded `SHUTDOWN_DRAIN_TIMEOUT_SECS`
+  that auto-escalates to teardown could be added if launchd/systemd's own
+  timeout proves too blunt.
+- **No checkpointing.** Per-job state is not checkpoint-able, so a forced
+  teardown (or SIGKILL) still throws away a VM's in-progress work; the next
+  start's GC just reaps it. A checkpoint-able per-job state machine would let a
+  longer drain resume rather than restart.
 
 ## Metrics and observability
 

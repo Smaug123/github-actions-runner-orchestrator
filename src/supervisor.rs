@@ -15,11 +15,14 @@
 //   * only then does it acquire a permit and spawn a worker,
 //   * a GC task runs on an interval and at startup.
 //
-// SIGINT handling lives in main(); when ctrl_c fires the runtime is torn
-// down. In-flight VMs survive (they're separate Lima processes); the next
-// startup's GC sweep cleans them up via the stale-cur/ logic and Lima list.
+// Shutdown handling lives here (see `run` + `run_shutdown`): SIGTERM, or the
+// first Ctrl+C, pauses new claims and drains in-flight VMs before exiting
+// cleanly; a second Ctrl+C forces an immediate teardown, leaving those VMs
+// (separate Lima processes) for the next startup's GC sweep — the stale-cur/
+// logic and Lima list — to reap.
 
 use std::collections::HashSet;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -302,7 +305,123 @@ pub async fn run(rt: Runtime) -> Result<()> {
         Ok::<(), anyhow::Error>(())
     };
 
-    supervise(dispatch, watcher, gc, reconciler).await
+    // Graceful-shutdown wiring. A dedicated listener task owns the OS signal
+    // streams and translates them into two notifications:
+    //   * `graceful` — the first SIGTERM or SIGINT: begin a clean drain.
+    //   * `force`    — any subsequent SIGINT (a second Ctrl+C): tear down now.
+    // Installing the handlers here (not inside the task) makes a failure fail
+    // startup, and holding both streams for the task's whole life leaves no
+    // window where a signal falls through to the default (process-killing)
+    // disposition.
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut sigint = signal(SignalKind::interrupt()).context("install SIGINT handler")?;
+    let mut sigterm = signal(SignalKind::terminate()).context("install SIGTERM handler")?;
+    let graceful = Arc::new(tokio::sync::Notify::new());
+    let force = Arc::new(tokio::sync::Notify::new());
+    {
+        let graceful = Arc::clone(&graceful);
+        let force = Arc::clone(&force);
+        tokio::spawn(async move {
+            // First SIGTERM or SIGINT requests a graceful drain.
+            tokio::select! {
+                _ = sigint.recv() => {}
+                _ = sigterm.recv() => {}
+            }
+            graceful.notify_one();
+            // Any further SIGINT (the second Ctrl+C) forces immediate teardown.
+            sigint.recv().await;
+            force.notify_one();
+        });
+    }
+
+    let shutdown = run_shutdown(
+        pause_tx.clone(),
+        Arc::clone(&permits),
+        // max_concurrency is an operator-set small integer and the semaphore
+        // was created from this same usize, so the acquire_many count matches
+        // the semaphore's capacity exactly.
+        u32::try_from(config.max_concurrency).unwrap_or(u32::MAX),
+        {
+            let graceful = Arc::clone(&graceful);
+            async move { graceful.notified().await }
+        },
+        async move { force.notified().await },
+    );
+
+    // Race a clean shutdown against the supervised tasks. `biased` so a resolved
+    // shutdown wins deterministically; during normal operation `shutdown` is
+    // parked on the first signal, so `supervise` drives the daemon as before. A
+    // supervised task dying *during* the drain still surfaces as an Err here
+    // (fail loud) rather than being masked by the in-progress clean exit.
+    tokio::select! {
+        biased;
+        outcome = shutdown => {
+            match outcome {
+                Shutdown::Drained => {
+                    info!("drained: all in-flight jobs finished; exiting cleanly")
+                }
+                Shutdown::Forced => warn!(
+                    "second interrupt: forcing teardown (in-flight VMs left for next-start GC)"
+                ),
+            }
+            Ok(())
+        }
+        r = supervise(dispatch, watcher, gc, reconciler) => r,
+    }
+}
+
+/// Which shutdown path completed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Shutdown {
+    /// Every in-flight job released its permit before a force signal arrived, so
+    /// no VM was abandoned. Exit cleanly.
+    Drained,
+    /// A force signal (second Ctrl+C) arrived mid-drain: exit now and leave the
+    /// still-running VMs for the next start's GC sweep.
+    Forced,
+}
+
+/// Drive graceful shutdown.
+///
+/// On the first `graceful` signal we flip the pause gate (dispatch stops
+/// claiming, the reconciler skips) and then wait for every in-flight job to
+/// finish. "Every job finished" is exactly "all `max_concurrency` permits are
+/// free": `spawn_job` holds a permit for the job's whole life and drops it after
+/// finalize, and while paused nothing acquires one — so `acquire_many` completes
+/// precisely when the last VM has drained. A `force` signal racing that wait
+/// abandons it (`Forced`).
+///
+/// No internal timeout: an in-flight job is already bounded by
+/// `JOB_MAX_RUNTIME_SECS` (its watchdog), and an operator's second Ctrl+C or the
+/// service manager's own SIGKILL timeout bounds the wait from outside.
+async fn run_shutdown(
+    pause: tokio::sync::watch::Sender<bool>,
+    permits: Arc<Semaphore>,
+    max_concurrency: u32,
+    graceful: impl Future<Output = ()>,
+    force: impl Future<Output = ()>,
+) -> Shutdown {
+    graceful.await;
+    // send() errors only if every receiver is gone (the supervisor is already
+    // tearing down); we're shutting down regardless, so ignore it.
+    let _ = pause.send(true);
+    info!(
+        max_concurrency,
+        "shutdown requested: paused new claims, draining in-flight jobs (interrupt again to force)"
+    );
+    tokio::select! {
+        // `biased`: if we are already fully drained, prefer the clean exit even
+        // when a force signal is simultaneously ready — there is nothing left to
+        // force. While a job is still running the drain arm is Pending, so a
+        // force signal still wins promptly.
+        biased;
+        // Acquiring every permit means no job is still running. The guard is
+        // dropped immediately; we only wanted the "all free" edge. The semaphore
+        // is never closed in normal operation, and a close would only mean
+        // nothing is left to hold a permit — either way the drain is complete.
+        _ = permits.acquire_many(max_concurrency) => Shutdown::Drained,
+        _ = force => Shutdown::Forced,
+    }
 }
 
 /// Race the dispatch loop against every long-lived supervisory task and translate
@@ -1358,5 +1477,149 @@ mod tests {
                 Prepared::Skip => write!(f, "Skip"),
             }
         }
+    }
+
+    // -- run_shutdown: graceful drain coordinator ---------------------------
+    //
+    // These drive `run_shutdown` with hand-controlled futures instead of real
+    // OS signals: a `Notify` (or a ready/pending future) stands in for each
+    // signal, and held `OwnedSemaphorePermit`s stand in for in-flight jobs. Time
+    // is virtual (`start_paused`), so "still draining" is proven deterministically
+    // by a `timeout` elapsing rather than by sleeping and hoping.
+
+    use tokio::sync::{Notify, Semaphore};
+
+    // A future that resolves immediately — an already-delivered signal.
+    fn ready() -> impl Future<Output = ()> {
+        std::future::ready(())
+    }
+
+    // A future that never resolves — a signal that never arrives.
+    fn never() -> impl Future<Output = ()> {
+        std::future::pending()
+    }
+
+    // The coordinator must not touch the pause gate or exit until the graceful
+    // signal arrives; once it does (with nothing in flight) it drains at once.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_waits_for_graceful_signal_then_drains() {
+        let permits = Arc::new(Semaphore::new(1));
+        let (pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+        let graceful = Arc::new(Notify::new());
+        let g = Arc::clone(&graceful);
+        let mut handle = tokio::spawn(run_shutdown(
+            pause_tx,
+            Arc::clone(&permits),
+            1,
+            async move { g.notified().await },
+            never(),
+        ));
+
+        // No graceful yet: still running, pause untouched.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(30), &mut handle)
+                .await
+                .is_err(),
+            "must not exit before the graceful signal"
+        );
+        assert!(!*pause_rx.borrow(), "pause must not flip before the signal");
+
+        // Fire graceful; with nothing in flight it drains immediately.
+        graceful.notify_one();
+        let outcome = tokio::time::timeout(Duration::from_secs(30), &mut handle)
+            .await
+            .expect("should drain")
+            .expect("task ok");
+        assert_eq!(outcome, Shutdown::Drained);
+        assert!(*pause_rx.borrow(), "drain must have paused new claims");
+    }
+
+    // The drain must block until the last in-flight permit is released, for any
+    // capacity and any number of jobs in flight.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_drains_exactly_when_all_permits_released() {
+        for max in [1u32, 2, 5] {
+            for held in 0..=max {
+                let permits = Arc::new(Semaphore::new(max as usize));
+                let (pause_tx, mut pause_rx) = tokio::sync::watch::channel(false);
+                let mut guards = Vec::new();
+                for _ in 0..held {
+                    guards.push(Arc::clone(&permits).acquire_owned().await.unwrap());
+                }
+
+                let mut handle = tokio::spawn(run_shutdown(
+                    pause_tx,
+                    Arc::clone(&permits),
+                    max,
+                    ready(), // graceful already delivered
+                    never(), // never forced
+                ));
+
+                // The pause gate flips as soon as the graceful signal is seen.
+                pause_rx.wait_for(|p| *p).await.unwrap();
+
+                if held > 0 {
+                    assert!(
+                        tokio::time::timeout(Duration::from_secs(30), &mut handle)
+                            .await
+                            .is_err(),
+                        "max={max} held={held}: must keep draining while permits are held"
+                    );
+                }
+
+                // Release every in-flight permit; now the drain completes.
+                drop(guards);
+                let outcome = tokio::time::timeout(Duration::from_secs(30), &mut handle)
+                    .await
+                    .expect("should drain once permits free")
+                    .expect("task ok");
+                assert_eq!(outcome, Shutdown::Drained, "max={max} held={held}");
+            }
+        }
+    }
+
+    // A force signal (second Ctrl+C) mid-drain abandons the wait even though a
+    // permit is still held (a VM still running).
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_force_aborts_drain_with_permit_held() {
+        let permits = Arc::new(Semaphore::new(2));
+        let (pause_tx, mut pause_rx) = tokio::sync::watch::channel(false);
+        let _held = Arc::clone(&permits).acquire_owned().await.unwrap(); // never released
+        let force = Arc::new(Notify::new());
+
+        let f = Arc::clone(&force);
+        let mut handle = tokio::spawn(run_shutdown(
+            pause_tx,
+            Arc::clone(&permits),
+            2,
+            ready(),
+            async move { f.notified().await },
+        ));
+
+        pause_rx.wait_for(|p| *p).await.unwrap();
+        // Not drained (a permit is held) and not yet forced.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(30), &mut handle)
+                .await
+                .is_err(),
+            "must keep draining until forced"
+        );
+
+        force.notify_one();
+        let outcome = tokio::time::timeout(Duration::from_secs(30), &mut handle)
+            .await
+            .expect("force must resolve the wait")
+            .expect("task ok");
+        assert_eq!(outcome, Shutdown::Forced);
+    }
+
+    // When both edges are ready at once, drain wins: a job that finished before
+    // the second Ctrl+C should still be reported as a clean drain, not forced.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_prefers_drained_when_already_empty() {
+        let permits = Arc::new(Semaphore::new(1)); // nothing held -> fully drained
+        let (pause_tx, _pause_rx) = tokio::sync::watch::channel(false);
+        let outcome = run_shutdown(pause_tx, permits, 1, ready(), ready()).await;
+        assert_eq!(outcome, Shutdown::Drained);
     }
 }

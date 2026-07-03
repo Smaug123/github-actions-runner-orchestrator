@@ -32,6 +32,10 @@ zeroize = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 tempfile = "3"
+# test-util enables `#[tokio::test(start_paused = true)]` (virtual time) for the
+# shutdown-drain tests. A dev-dependency feature, so it never lands in the
+# release binary.
+tokio = { version = "1", features = ["test-util"] }
 
 [profile.release]
 lto = "thin"

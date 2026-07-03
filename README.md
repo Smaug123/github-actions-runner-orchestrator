@@ -215,6 +215,21 @@ captured in `new/` and drained on restart. A blunt restart without pausing is
 also safe for *queued* jobs, but abandons in-flight VMs (GC reaps them only
 after `JOB_MAX_RUNTIME_SECS`).
 
+### Shutdown signals
+
+The same drain happens automatically on shutdown signals, so under launchd /
+systemd you don't need the manual `pause` dance:
+
+- **SIGTERM**, or the **first Ctrl+C** (SIGINT), pauses new claims and waits for
+  in-flight VMs to finish, then exits cleanly — no orphaned VMs.
+- A **second Ctrl+C** forces an immediate teardown, abandoning in-flight VMs
+  (the next start's GC reaps them after `JOB_MAX_RUNTIME_SECS`).
+
+There is no drain deadline: a stuck job holds shutdown open until its
+`JOB_MAX_RUNTIME_SECS` watchdog fires, unless you send a second Ctrl+C or your
+service manager escalates to SIGKILL. Under a service manager, set its stop
+timeout accordingly.
+
 ## Guest VM
 
 Whichever guest is used, the contract is the same: the consumer copies the
