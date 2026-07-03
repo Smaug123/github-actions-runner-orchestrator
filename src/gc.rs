@@ -848,6 +848,17 @@ async fn reconcile_inner(
                 Ok(p) => p,
                 Err(_) => return Ok(()),
             };
+            // Re-check pause now that we hold the permit, before writing any
+            // claim. The line-821 check and this acquire have no await between
+            // them, but on the multi-threaded runtime a concurrent `pause` flip
+            // (control endpoint, or a SIGTERM/Ctrl+C drain) can still land in the
+            // gap. Mirrors the dispatch loop's re-check-after-acquire: bail and
+            // drop the permit so a draining daemon can reach in_flight == 0
+            // instead of waiting on a job we minted after shutdown began.
+            if *paused.borrow() {
+                drop(permit);
+                return Ok(());
+            }
             match spool
                 .write_synthetic_claim(&job, repo_full, webhook_secret)
                 .await

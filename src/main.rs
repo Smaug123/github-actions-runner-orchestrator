@@ -135,11 +135,9 @@ async fn main() -> Result<()> {
         allowed_repos,
         runner_labels,
     };
-    tokio::select! {
-        r = supervisor::run(runtime) => r?,
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!("SIGINT; exiting (in-flight VMs left for next-start GC)");
-        }
-    }
-    Ok(())
+    // The supervisor owns shutdown handling: SIGTERM (or the first Ctrl+C)
+    // pauses new claims and drains in-flight VMs before exiting cleanly, a
+    // second Ctrl+C forces immediate teardown. It returns Ok on any clean or
+    // forced shutdown and Err only on genuine failure.
+    supervisor::run(runtime).await
 }
